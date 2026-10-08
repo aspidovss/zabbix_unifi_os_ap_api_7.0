@@ -1,4 +1,4 @@
-# Zabbix_unifi_os_ap_api_7.0
+# Zabbix Template Monitoring AP over api 7.0
 
 **UniFi Network API — Zabbix 7.0 template for UniFi OS access points**
 
