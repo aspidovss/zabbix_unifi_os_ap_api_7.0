@@ -1,0 +1,2095 @@
+zabbix_export:
+  version: '7.0'
+  template_groups:
+    - uuid: 36bff6c29af64692839d077febfc7079
+      name: Templates/Network devices
+  host_groups:
+    - uuid: 4c0f56220ce54f649a2a4df37d4ca0c1
+      name: UniFi Network/Sites
+    - uuid: 0773082d66f540b8ae6dce4cb0aa023d
+      name: UniFi Network/Access Points
+  templates:
+    - uuid: 8d4ea8f16d5044cf97058459be7b5f6a
+      template: UniFi Network API
+      name: UniFi Network API
+      description: |
+        UniFi Network monitoring for Zabbix 7.0: sites and access points.
+        Release 1.0.0. Project: Zabbix_unifi_os_ap_api_7.0 (author AspidovSS, MIT License).
+        Based on https://github.com/MassimilianoPasquini97/zbx_unifi_network_api
+
+        This host discovers Site hosts (Discovery Sites) and Access Point hosts (Discovery Access Points, all sites).
+        Zabbix 7.0 does not run host prototypes on discovered hosts, so AP discovery lives on this host.
+        Only devices with feature 'accessPoint' are discovered.
+
+        REQUIRED GLOBAL MACROS (Administration -> Macros):
+        - {$UNIFI_NETWORK_API_ADDRESS}: Text. IP or DNS of the UniFi OS console, with :port if not 443.
+        - {$UNIFI_NETWORK_API_KEY}: Vault secret (e.g. secret/zabbix/unifi:api-key) or Secret text.
+        Do NOT define these two macros on templates or hosts.
+      groups:
+        - name: Templates/Network devices
+      items:
+        - uuid: c3ebff2207424f42a4e081fabe368957
+          name: Application Version
+          type: HTTP_AGENT
+          key: application.version
+          delay: '{$ITEM_APPLICATION.VERSION_UPDATE}'
+          history: '{$ITEM_APPLICATION.VERSION_HISTORY}'
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.applicationVersion
+          url: https://{$UNIFI_NETWORK_API_ADDRESS}/proxy/network/integration/v1/info
+          headers:
+            - name: Accept
+              value: application/json
+            - name: X-API-KEY
+              value: '{$UNIFI_NETWORK_API_KEY}'
+          triggers:
+            - uuid: bf3b92521aef441990f97279bfe69b24
+              expression: change(/UniFi Network API/application.version)=1
+              name: Application Version Changed
+              priority: INFO
+            - uuid: 96cbe8689a6d4c22b65df5e971d09506
+              expression: nodata(/UniFi Network API/application.version,{$TRIGGER_NODATA})=1
+              name: No Data for {$TRIGGER_NODATA}
+              priority: HIGH
+          tags:
+            - tag: UniFi Component
+              value: System
+        - uuid: d6bb0983f9fe45348b4cd8e2785bd941
+          name: Sites JSON
+          type: HTTP_AGENT
+          key: sites.json
+          delay: '{$ITEM_SITES.JSON_UPDATE}'
+          history: '0'
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.data
+          url: https://{$UNIFI_NETWORK_API_ADDRESS}/proxy/network/integration/v1/sites
+          query_fields:
+            - name: limit
+              value: '200'
+          headers:
+            - name: Accept
+              value: application/json
+            - name: X-API-KEY
+              value: '{$UNIFI_NETWORK_API_KEY}'
+          tags:
+            - tag: UniFi Component
+              value: Raw
+        - uuid: eaab8cbe2c434b1db68ca19ce7ad9f0f
+          name: Access Points JSON (all sites)
+          type: SCRIPT
+          key: aps.json
+          delay: '{$ITEM_APS.JSON_UPDATE}'
+          history: '0'
+          value_type: TEXT
+          params: |
+            var p = JSON.parse(value);
+            var base = 'https://' + p.address + '/proxy/network/integration/v1';
+
+            var req = new HttpRequest();
+            req.addHeader('Accept: application/json');
+            req.addHeader('X-API-KEY: ' + p.api_key);
+
+            function getAll(path) {
+                var out = [], offset = 0, total = 0, pages = 0, j;
+                do {
+                    var resp = req.get(base + path + '?limit=200&offset=' + offset);
+                    if (req.getStatus() != 200) {
+                        throw 'UniFi API HTTP ' + req.getStatus() + ' on ' + path + ': ' + String(resp).substring(0, 200);
+                    }
+                    j = JSON.parse(resp);
+                    total = j.totalCount;
+                    out = out.concat(j.data);
+                    offset += j.data.length;
+                    pages++;
+                } while (j.data.length > 0 && offset < total && pages < 50);
+                return out;
+            }
+
+            var sites = getAll('/sites');
+            var aps = [], failed = 0, failedNames = [];
+
+            for (var s = 0; s < sites.length; s++) {
+                var devs;
+                try {
+                    devs = getAll('/sites/' + sites[s].id + '/devices');
+                } catch (e) {
+                    failed++;
+                    failedNames.push(sites[s].name);
+                    Zabbix.log(3, '[UniFi AP discovery] site "' + sites[s].name + '": ' + e);
+                    continue;
+                }
+                for (var i = 0; i < devs.length; i++) {
+                    var f = devs[i].features || [];
+                    if (f.indexOf('accessPoint') === -1) continue;
+                    aps.push({
+                        id: devs[i].id,
+                        name: devs[i].name || devs[i].macAddress,
+                        model: devs[i].model,
+                        mac: devs[i].macAddress,
+                        state: devs[i].state,
+                        site_id: sites[s].id,
+                        site_name: sites[s].name,
+                        site_ref: sites[s].internalReference
+                    });
+                }
+            }
+
+            if (failed > 0) {
+                // never return a partial list: discovery would treat APs of failed sites as deleted
+                throw 'UniFi API: devices request failed for ' + failed + ' of ' + sites.length + ' sites: ' + failedNames.join(', ');
+            }
+
+            return JSON.stringify(aps);
+          timeout: 300s
+          parameters:
+            - name: address
+              value: '{$UNIFI_NETWORK_API_ADDRESS}'
+            - name: api_key
+              value: '{$UNIFI_NETWORK_API_KEY}'
+          description: All devices with feature accessPoint from all sites, paginated. Source for Discovery Access Points.
+          tags:
+            - tag: UniFi Component
+              value: Raw
+        - uuid: 710d563918d04a66b583991e37ed674a
+          name: Access Points Total (all sites)
+          type: DEPENDENT
+          key: aps.total
+          delay: '0'
+          history: '{$ITEM_APS_HISTORY}'
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  return JSON.parse(value).length;
+          master_item:
+            key: aps.json
+          tags:
+            - tag: UniFi Component
+              value: Access Points
+        - uuid: 4736de0619fc478785fedbffddae1164
+          name: Access Points Offline (all sites)
+          type: DEPENDENT
+          key: aps.offline
+          delay: '0'
+          history: '{$ITEM_APS_HISTORY}'
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var a = JSON.parse(value), n = 0;
+                  for (var i = 0; i < a.length; i++) {
+                      if (a[i].state !== 'ONLINE') n++;
+                  }
+                  return n;
+          master_item:
+            key: aps.json
+          tags:
+            - tag: UniFi Component
+              value: Access Points
+      discovery_rules:
+        - uuid: 547add54b79142c29ed100b9b17182a9
+          name: Discovery Sites
+          type: DEPENDENT
+          key: discovery.sites
+          delay: '0'
+          host_prototypes:
+            - uuid: 1a55e15794694c3dbf70993f49731617
+              host: '{#ID}'
+              name: UniFi [{#NAME}] - Site
+              group_links:
+                - group:
+                    name: UniFi Network/Sites
+              templates:
+                - name: UniFi Network API - Site
+              macros:
+                - macro: '{$SITE.ID}'
+                  value: '{#ID}'
+                  description: Site ID. Used by Template, DO NOT CHANGE OR DELETE.
+                - macro: '{$SITE.NAME}'
+                  value: '{#NAME}'
+                  description: Site NAME. Used by Template, DO NOT CHANGE OR DELETE.
+              tags:
+                - tag: UniFi Type
+                  value: Site
+          master_item:
+            key: sites.json
+          lld_macro_paths:
+            - lld_macro: '{#ID}'
+              path: $.id
+            - lld_macro: '{#NAME}'
+              path: $.name
+        - uuid: 480ac1b10c3c449a9ab27235159fb386
+          name: Discovery Access Points
+          type: DEPENDENT
+          key: discovery.aps
+          delay: '0'
+          host_prototypes:
+            - uuid: 9a78941ed43e42cdbffb076098b202a3
+              host: '{#ID}'
+              name: UniFi [{#SITE.NAME}] - AP:{#NAME}
+              group_links:
+                - group:
+                    name: UniFi Network/Access Points
+              templates:
+                - name: UniFi Network API - Device
+              macros:
+                - macro: '{$SITE.ID}'
+                  value: '{#SITE.ID}'
+                  description: Site ID. Used by Template, DO NOT CHANGE OR DELETE.
+                - macro: '{$SITE.NAME}'
+                  value: '{#SITE.NAME}'
+                  description: Site NAME. Used by Template, DO NOT CHANGE OR DELETE.
+                - macro: '{$AP.MAC}'
+                  value: '{#MAC}'
+                  description: AP MAC. Used by Template, DO NOT CHANGE OR DELETE.
+                - macro: '{$SITE.REF}'
+                  value: '{#SITE.REF}'
+                  description: Site short name (internalReference). Used by Template, DO NOT CHANGE OR DELETE.
+              tags:
+                - tag: UniFi Site
+                  value: '{#SITE.NAME}'
+                - tag: UniFi Type
+                  value: Access Point
+                - tag: UniFi Model
+                  value: '{#MODEL}'
+          master_item:
+            key: aps.json
+          lld_macro_paths:
+            - lld_macro: '{#ID}'
+              path: $.id
+            - lld_macro: '{#NAME}'
+              path: $.name
+            - lld_macro: '{#MODEL}'
+              path: $.model
+            - lld_macro: '{#SITE.ID}'
+              path: $.site_id
+            - lld_macro: '{#SITE.NAME}'
+              path: $.site_name
+            - lld_macro: '{#MAC}'
+              path: $.mac
+            - lld_macro: '{#SITE.REF}'
+              path: $.site_ref
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var a = JSON.parse(value), out = [];
+                  for (var i = 0; i < a.length; i++) {
+                      out.push({id: a[i].id, name: a[i].name, model: a[i].model, mac: a[i].mac,
+                                site_id: a[i].site_id, site_name: a[i].site_name, site_ref: a[i].site_ref});
+                  }
+                  out.sort(function (x, y) { return x.id < y.id ? -1 : (x.id > y.id ? 1 : 0); });
+                  return JSON.stringify(out);
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - '{$LLD_APS_HEARTBEAT}'
+      macros:
+        - macro: '{$ITEM_APPLICATION.VERSION_HISTORY}'
+          value: 7d
+          description: Item 'application.version' History
+        - macro: '{$ITEM_APPLICATION.VERSION_UPDATE}'
+          value: 10m
+          description: Item 'application.version' Update Interval
+        - macro: '{$ITEM_APS.JSON_UPDATE}'
+          value: 30m
+          description: Item 'aps.json' Update Interval (AP counters; discovery itself runs on change or once a day)
+        - macro: '{$ITEM_APS_HISTORY}'
+          value: 7d
+          description: Items 'aps.*' History
+        - macro: '{$ITEM_SITES.JSON_UPDATE}'
+          value: 1d
+          description: Item 'sites.json' Update Interval
+        - macro: '{$LLD_APS_HEARTBEAT}'
+          value: 1d
+          description: AP discovery runs when the AP list changes (added/removed/renamed) or at least once per this period
+        - macro: '{$TRIGGER_NODATA}'
+          value: 30m
+          description: Trigger 'No Data' after 30 minutes of missing data
+    - uuid: 9effe2d07c5d49e18a608372b170d506
+      template: UniFi Network API - Device
+      name: UniFi Network API - Access Point
+      groups:
+        - name: Templates/Network devices
+      items:
+        - uuid: fdf8252059174ce5ab3bf4e05c1ab2bb
+          name: Cpu Utilization
+          type: DEPENDENT
+          key: cpu.utilization
+          delay: '0'
+          history: '{$ITEM_CPU.UTILIZATION_HISTORY}'
+          value_type: FLOAT
+          units: '%'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.cpuUtilizationPct
+          master_item:
+            key: statistics.json
+          tags:
+            - tag: UniFi Component
+              value: CPU
+          triggers:
+            - uuid: c4c1ccfd817a4c61bb07841b5158f1c8
+              expression: avg(/UniFi Network API - Device/cpu.utilization,#3)>{$TRIGGER_CPUUTIL_AVERAGE}
+              name: CPU at {ITEM.VALUE}
+              priority: AVERAGE
+            - uuid: 6c8562518e8e489f8f47d1ad01e4d3d7
+              expression: avg(/UniFi Network API - Device/cpu.utilization,#3)>{$TRIGGER_CPUUTIL_WARNING}
+              name: CPU at {ITEM.VALUE}
+              priority: WARNING
+              dependencies:
+                - name: CPU at {ITEM.VALUE}
+                  expression: avg(/UniFi Network API - Device/cpu.utilization,#3)>{$TRIGGER_CPUUTIL_AVERAGE}
+        - uuid: ec9e3591b38643099d870e217997d675
+          name: Device Details JSON
+          type: HTTP_AGENT
+          key: details.json
+          delay: '{$ITEM_DETAILS.JSON_UPDATE}'
+          history: '0'
+          value_type: TEXT
+          url: https://{$UNIFI_NETWORK_API_ADDRESS}/proxy/network/integration/v1/sites/{$SITE.ID}/devices/{HOST.HOST}
+          headers:
+            - name: Accept
+              value: application/json
+            - name: X-API-KEY
+              value: '{$UNIFI_NETWORK_API_KEY}'
+          tags:
+            - tag: UniFi Component
+              value: Raw
+        - uuid: d36340014dc34d61b13effc3f625f07d
+          name: Firmware Version
+          type: DEPENDENT
+          key: firmware.version
+          delay: '0'
+          history: '{$ITEM_FIRMWARE.VERSION_HISTORY}'
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.firmwareVersion
+          master_item:
+            key: details.json
+          tags:
+            - tag: UniFi Component
+              value: System
+        - uuid: 6091c4f0f34d4bcf8b5503559f6af385
+          name: IP
+          type: DEPENDENT
+          key: ip
+          delay: '0'
+          history: '{$ITEM_IP_HISTORY}'
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.ipAddress
+          master_item:
+            key: details.json
+          tags:
+            - tag: UniFi Component
+              value: Uplink
+        - uuid: 15df9264a3b944cbad8c26ca42f78957
+          name: Load Avg 1M
+          type: DEPENDENT
+          key: loadAverage1Min
+          delay: '0'
+          history: '{$ITEM_LOADAVG_HISTORY}'
+          value_type: FLOAT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.loadAverage1Min
+          master_item:
+            key: statistics.json
+          tags:
+            - tag: UniFi Component
+              value: CPU
+        - uuid: 4faeda3aac434951995a146941e2c06a
+          name: Load Avg 5M
+          type: DEPENDENT
+          key: loadAverage5Min
+          delay: '0'
+          history: '{$ITEM_LOADAVG_HISTORY}'
+          value_type: FLOAT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.loadAverage5Min
+          master_item:
+            key: statistics.json
+          tags:
+            - tag: UniFi Component
+              value: CPU
+        - uuid: c58d771863c045f696c9ef36bb20f245
+          name: Load Avg 15M
+          type: DEPENDENT
+          key: loadAverage15Min
+          delay: '0'
+          history: '{$ITEM_LOADAVG_HISTORY}'
+          value_type: FLOAT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.loadAverage15Min
+          master_item:
+            key: statistics.json
+          tags:
+            - tag: UniFi Component
+              value: CPU
+        - uuid: 3063632cd1ee4ccda3baf9353f21b4e2
+          name: Macaddress
+          type: DEPENDENT
+          key: macaddress
+          delay: '0'
+          history: '{$ITEM_MACADDRESS_HISTORY}'
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.macAddress
+          master_item:
+            key: details.json
+          tags:
+            - tag: UniFi Component
+              value: System
+        - uuid: fb9974b8b4f04f189a5c289e3ef39518
+          name: Memory Utilization
+          type: DEPENDENT
+          key: memory.utilization
+          delay: '0'
+          history: '{$ITEM_MEMORY.UTILIZATION_HISTORY}'
+          value_type: FLOAT
+          units: '%'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.memoryUtilizationPct
+          master_item:
+            key: statistics.json
+          tags:
+            - tag: UniFi Component
+              value: Memory
+          triggers:
+            - uuid: d92f8bac381c443a88a6af0d75949e7a
+              expression: avg(/UniFi Network API - Device/memory.utilization,#3)>{$TRIGGER_MEMUTIL_AVERAGE}
+              name: Memory at {ITEM.VALUE}
+              priority: AVERAGE
+            - uuid: 664553a4883d495cbb035daec58515bb
+              expression: avg(/UniFi Network API - Device/memory.utilization,#3)>{$TRIGGER_MEMUTIL_WARNING}
+              name: Memory at {ITEM.VALUE}
+              priority: WARNING
+              dependencies:
+                - name: Memory at {ITEM.VALUE}
+                  expression: avg(/UniFi Network API - Device/memory.utilization,#3)>{$TRIGGER_MEMUTIL_AVERAGE}
+        - uuid: 74230185918d4d3e813a8aed18fc1ef6
+          name: Model
+          type: DEPENDENT
+          key: model
+          delay: '0'
+          history: '{$ITEM_MODEL_HISTORY}'
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.model
+          master_item:
+            key: details.json
+          tags:
+            - tag: UniFi Component
+              value: System
+        - uuid: bc4db9ab04e245edb5df8efeb84c9ce8
+          name: Name
+          type: DEPENDENT
+          key: name
+          delay: '0'
+          history: '{$ITEM_NAME_HISTORY}'
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.name
+          master_item:
+            key: details.json
+          tags:
+            - tag: UniFi Component
+              value: System
+        - uuid: 96e79913ce84422ca509cd71fd71d392
+          name: State
+          type: DEPENDENT
+          key: state
+          delay: '0'
+          history: '{$ITEM_STATE_HISTORY}'
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.state
+          master_item:
+            key: details.json
+          triggers:
+            - uuid: 18834a85514d43efba36c9a504bec86f
+              expression: last(/UniFi Network API - Device/state)="OFFLINE" or last(/UniFi Network API - Device/state)="CONNECTION_INTERRUPTED" or last(/UniFi Network API - Device/state)="ISOLATED"
+              name: State is in "{ITEM.VALUE}"
+              priority: HIGH
+            - uuid: 211320bc8f424c90ad92043ca435ea47
+              expression: last(/UniFi Network API - Device/state)="PENDING_ADOPTION" or last(/UniFi Network API - Device/state)="DELETING"
+              name: State is in "{ITEM.VALUE}"
+              priority: WARNING
+            - uuid: 1a32d0be09e4471394548038d99e6c55
+              expression: last(/UniFi Network API - Device/state)="UPDATING" or last(/UniFi Network API - Device/state)="GETTING_READY"
+              name: State is in "{ITEM.VALUE}"
+              priority: INFO
+          tags:
+            - tag: UniFi Component
+              value: System
+        - uuid: 4b17b0e66d0e44028751b97f42e19e9b
+          name: Device Statistics JSON
+          type: HTTP_AGENT
+          key: statistics.json
+          delay: '{$ITEM_STATISTICS.JSON_UPDATE}'
+          history: '0'
+          value_type: TEXT
+          url: https://{$UNIFI_NETWORK_API_ADDRESS}/proxy/network/integration/v1/sites/{$SITE.ID}/devices/{HOST.HOST}/statistics/latest
+          headers:
+            - name: Accept
+              value: application/json
+            - name: X-API-KEY
+              value: '{$UNIFI_NETWORK_API_KEY}'
+          tags:
+            - tag: UniFi Component
+              value: Raw
+        - uuid: fe29e1a31a46429196a2571d6f4429e3
+          name: Uplink Down Rate
+          type: DEPENDENT
+          key: uplink.rx
+          delay: '0'
+          history: '{$ITEM_UPLINK_HISTORY}'
+          value_type: FLOAT
+          units: bps
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.uplink.rxRateBps
+          master_item:
+            key: statistics.json
+          tags:
+            - tag: UniFi Component
+              value: Uplink
+        - uuid: f71d116c83b347f690ed21ab559a7417
+          name: Uplink Up Rate
+          type: DEPENDENT
+          key: uplink.tx
+          delay: '0'
+          history: '{$ITEM_UPLINK_HISTORY}'
+          value_type: FLOAT
+          units: bps
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.uplink.txRateBps
+          master_item:
+            key: statistics.json
+          tags:
+            - tag: UniFi Component
+              value: Uplink
+        - uuid: 94f25b53cfa1429a843e51c8e2021f32
+          name: Uptime
+          type: DEPENDENT
+          key: uptime
+          delay: '0'
+          history: '{$ITEM_UPTIME_HISTORY}'
+          units: uptime
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.uptimeSec
+          master_item:
+            key: statistics.json
+          triggers:
+            - uuid: 9484a42938aa4a87899e9e34cc16a285
+              expression: last(/UniFi Network API - Device/uptime)<last(/UniFi Network API - Device/uptime,#2)
+              name: Device Rebooted, last Uptime "{ITEM.VALUE2}"
+              priority: INFO
+          tags:
+            - tag: UniFi Component
+              value: System
+        - uuid: 9f0896899dcb480e97e756c45d2692a8
+          name: AP Wireless Clients and Anomalies JSON
+          type: SCRIPT
+          key: clients.json
+          delay: '{$ITEM_CLIENTS.JSON_UPDATE}'
+          history: '0'
+          value_type: TEXT
+          params: |
+            function anomalyIgnore(s) {
+                var m = {}, a = String(s || '').split(/[\s,;]+/);
+                for (var i = 0; i < a.length; i++) {
+                    if (a[i] && a[i].charAt(0) !== '{') m[a[i].toUpperCase()] = true;
+                }
+                return m;
+            }
+            function anomalyShort(t) {
+                return String(t).replace(/^(USER_|AP_)/, '');
+            }
+            // entries: [{anomaly, timestamps}] of one device; returns summary
+            function anomalySummary(entries, now, activeMin, ignore, onlyType) {
+                var step = 300000, win = activeMin * 60000;
+                var active = {}, streak = 0, streakType = 'none', hour = {}, n24 = 0;
+                for (var i = 0; i < entries.length; i++) {
+                    var e = entries[i];
+                    if (ignore[e.anomaly] || ignore[anomalyShort(e.anomaly)]) continue;
+                    if (onlyType && e.anomaly !== onlyType) continue;
+                    var ts = (e.timestamps || []).slice().sort(function (a, b) { return a - b; });
+                    if (!ts.length) continue;
+                    n24 += ts.length;
+                    for (var k = 0; k < ts.length; k++) {
+                        if (now - ts[k] <= 3600000) hour[ts[k]] = true;
+                    }
+                    var last = ts[ts.length - 1];
+                    if (now - last <= win) {
+                        active[anomalyShort(e.anomaly)] = true;
+                        var c = 1;
+                        for (var k = ts.length - 1; k > 0 && ts[k] - ts[k - 1] <= step; k--) c++;
+                        if (c * 5 > streak) {
+                            streak = c * 5;
+                            streakType = anomalyShort(e.anomaly);
+                        }
+                    }
+                }
+                var names = [];
+                for (var n in active) names.push(n);
+                names.sort();
+                var h = 0;
+                for (var t in hour) h++;
+                return {active: names.length ? names.join(', ') : 'none', streak_min: streak, streak_type: streakType,
+                        minutes_1h: h * 5, intervals_24h: n24};
+            }
+            var p = JSON.parse(value);
+            var base = 'https://' + p.address + '/proxy/network';
+            var req = new HttpRequest();
+            req.addHeader('Accept: application/json');
+            req.addHeader('X-API-KEY: ' + p.api_key);
+
+            function get(url) {
+                var resp = req.get(url);
+                if (req.getStatus() != 200) {
+                    throw 'UniFi API HTTP ' + req.getStatus() + ': ' + String(resp).substring(0, 200);
+                }
+                return JSON.parse(resp);
+            }
+
+            // 1. wireless clients of this AP (official API, paginated)
+            var clients = [], offset = 0, total = 0, pages = 0, j;
+            do {
+                j = get(base + '/integration/v1/sites/' + p.site_id + '/clients?limit=200&offset=' + offset);
+                total = j.totalCount;
+                for (var i = 0; i < j.data.length; i++) {
+                    var c = j.data[i];
+                    if (c.type !== 'WIRELESS' || c.uplinkDeviceId !== p.device_id) continue;
+                    clients.push({id: c.id, name: c.name, ip: c.ipAddress, mac: c.macAddress, connectedAt: c.connectedAt,
+                                  uplinkDeviceId: c.uplinkDeviceId, access: c.access ? c.access.type : null});
+                }
+                offset += j.data.length;
+                pages++;
+            } while (j.data.length > 0 && offset < total && pages < 50);
+
+            // 2. anomalies (internal API); a failure here must not break client counters
+            var anomalies = null;
+            try {
+                var now = Date.now();
+                var activeMin = parseInt(p.active_min, 10) || 15;
+                var ignore = anomalyIgnore(p.ignore);
+                var dev = (get(base + '/api/s/' + p.site_ref + '/stat/device/' + p.ap_mac).data || [])[0] || {};
+                var apMacs = {};
+                apMacs[String(p.ap_mac).toLowerCase()] = true;
+                if (dev.mac) apMacs[String(dev.mac).toLowerCase()] = true;
+                var lists = [dev.ethernet_table || [], dev.vap_table || []];
+                for (var l = 0; l < lists.length; l++) {
+                    for (var i = 0; i < lists[l].length; i++) {
+                        var m = lists[l][i].mac || lists[l][i].bssid;
+                        if (lists[l][i].bssid) apMacs[String(lists[l][i].bssid).toLowerCase()] = true;
+                        if (m) apMacs[String(m).toLowerCase()] = true;
+                    }
+                }
+                var an = get(base + '/api/s/' + p.site_ref + '/stat/anomalies').data || [];
+                var apEntries = [], byClient = {};
+                for (var i = 0; i < an.length; i++) {
+                    var mac = String(an[i].mac).toLowerCase();
+                    if (/^AP_/.test(an[i].anomaly)) {
+                        if (apMacs[mac]) apEntries.push(an[i]);
+                    } else {
+                        (byClient[mac] = byClient[mac] || []).push(an[i]);
+                    }
+                }
+                var apSum = anomalySummary(apEntries, now, activeMin, ignore);
+                var drop = anomalySummary(apEntries, now, activeMin, ignore, 'AP_HIGH_DROP_RATE');
+                var assoc = anomalySummary(apEntries, now, activeMin, ignore, 'AP_LONG_MAX_ASSOCIATION_TIME');
+                var withAn = [];
+                for (var i = 0; i < clients.length; i++) {
+                    var s = anomalySummary(byClient[String(clients[i].mac).toLowerCase()] || [], now, activeMin, ignore);
+                    if (s.active !== 'none') withAn.push(clients[i].name + ' | ' + s.active);
+                }
+                withAn.sort();
+                anomalies = {
+                    ap_active: apSum.active,
+                    ap_drop_streak_min: drop.streak_min,
+                    ap_long_assoc_1h: assoc.minutes_1h / 5,
+                    clients_count: withAn.length,
+                    clients_pct: clients.length ? Math.round(1000 * withAn.length / clients.length) / 10 : 0,
+                    clients_list: withAn.length ? withAn.join('\n') : 'none'
+                };
+            } catch (e) {
+                Zabbix.log(3, '[UniFi AP anomalies] ' + e);
+            }
+
+            return JSON.stringify({clients: clients, anomalies: anomalies});
+          timeout: 60s
+          parameters:
+            - name: address
+              value: '{$UNIFI_NETWORK_API_ADDRESS}'
+            - name: api_key
+              value: '{$UNIFI_NETWORK_API_KEY}'
+            - name: site_id
+              value: '{$SITE.ID}'
+            - name: site_ref
+              value: '{$SITE.REF}'
+            - name: device_id
+              value: '{HOST.HOST}'
+            - name: ap_mac
+              value: '{$AP.MAC}'
+            - name: ignore
+              value: '{$ANOMALY_IGNORE}'
+            - name: active_min
+              value: '{$ANOMALY_ACTIVE_MIN}'
+          description: Wireless clients of this AP (official API) + UniFi anomalies of the AP and of its clients (internal API stat/anomalies).
+          tags:
+            - tag: UniFi Component
+              value: Raw
+        - uuid: bb7f45ffd3184e2cb95c6e5f9cffb365
+          name: Clients Total
+          type: DEPENDENT
+          key: ap.clients.total
+          delay: '0'
+          history: '{$ITEM_AP.CLIENTS_HISTORY}'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.clients
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  return JSON.parse(value).length;
+          master_item:
+            key: clients.json
+          tags:
+            - tag: UniFi Component
+              value: Clients
+          triggers:
+            - uuid: 969ddab81e0a45c6947d6a4d6a665239
+              expression: min(/UniFi Network API - Device/ap.clients.total,{$TRIGGER_AP_CLIENTS_TIME})>{$TRIGGER_AP_CLIENTS_HIGH}
+              name: 'Too many clients on AP: {ITEM.LASTVALUE} (> {$TRIGGER_AP_CLIENTS_HIGH} for {$TRIGGER_AP_CLIENTS_TIME})'
+              priority: WARNING
+        - uuid: 2c3c8ed47f4947169d15d515b09f74fb
+          name: Clients Avg Connection Time
+          type: DEPENDENT
+          key: ap.clients.avg_duration
+          delay: '0'
+          history: '{$ITEM_AP.CLIENTS_HISTORY}'
+          value_type: FLOAT
+          units: s
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.clients
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var a = JSON.parse(value);
+                  var now = Date.now(), sum = 0, n = 0;
+                  for (var i = 0; i < a.length; i++) {
+                      var t = Date.parse(a[i].connectedAt);
+                      if (!isNaN(t)) {
+                          sum += (now - t) / 1000;
+                          n++;
+                      }
+                  }
+                  return n ? Math.round(sum / n) : 0;
+          master_item:
+            key: clients.json
+          tags:
+            - tag: UniFi Component
+              value: Clients
+        - uuid: 9e581c4576d74e7dbbe98ba741555fc8
+          name: Clients List
+          type: DEPENDENT
+          key: ap.clients.list
+          delay: '0'
+          history: '{$ITEM_AP.CLIENTS.LIST_HISTORY}'
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.clients
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var a = JSON.parse(value);
+                  a.sort(function (x, y) {
+                      return String(x.name).toLowerCase() < String(y.name).toLowerCase() ? -1 : 1;
+                  });
+                  var lines = [];
+                  for (var i = 0; i < a.length; i++) {
+                      lines.push(a[i].name + ' | ' + a[i].ip + ' | ' + a[i].mac);
+                  }
+                  return lines.length ? lines.join('\n') : 'no clients';
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1h
+          master_item:
+            key: clients.json
+          tags:
+            - tag: UniFi Component
+              value: Clients
+        - uuid: 4c8ca32b71d74cbf8ab723f3fd8148cb
+          name: Device Stat JSON (radio and uplink details)
+          type: HTTP_AGENT
+          key: stat.json
+          delay: '{$ITEM_STAT.JSON_UPDATE}'
+          history: '0'
+          value_type: TEXT
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var j = JSON.parse(value);
+                  if (!j.data || !j.data.length) {
+                      throw 'UniFi device API: no data (' + (j.meta ? j.meta.msg : 'unknown') + ')';
+                  }
+                  var d = j.data[0];
+                  var st = (d.stat && d.stat.ap) ? d.stat.ap : {};
+                  var bands = {ng: '2.4GHz', na: '5GHz', '6e': '6GHz'};
+
+                  function num(k) {
+                      var v = st[k];
+                      return (v === undefined || v === null) ? 0 : Number(v);
+                  }
+
+                  var cfg = {};
+                  var rt = d.radio_table || [];
+                  for (var i = 0; i < rt.length; i++) {
+                      cfg[rt[i].name] = rt[i];
+                  }
+
+                  var radios = [];
+                  var rs = d.radio_table_stats || [];
+                  for (var i = 0; i < rs.length; i++) {
+                      var s = rs[i], c = cfg[s.name] || {}, r = s.radio, w = s.name;
+                      var gain = (s.gain !== undefined && s.gain !== null) ? s.gain : (c.antenna_gain || 0);
+                      radios.push({
+                          radio: r,
+                          band: bands[r] || r,
+                          state: s.state,
+                          channel: s.channel,
+                          bw: s.bw,
+                          tx_power: s.tx_power,
+                          antenna_gain: (c.antenna_gain !== undefined) ? c.antenna_gain : gain,
+                          eirp: s.tx_power + gain,
+                          cu_total: s.cu_total,
+                          cu_self_rx: s.cu_self_rx,
+                          cu_self_tx: s.cu_self_tx,
+                          satisfaction: s.satisfaction,
+                          num_sta: s.num_sta,
+                          guest_num_sta: s['guest-num_sta'] || 0,
+                          tx_retries_pct: s.tx_retries_pct,
+                          tx_packets: num(r + '-tx_packets'),
+                          tx_bytes: num(r + '-tx_bytes'),
+                          rx_packets: num(r + '-rx_packets'),
+                          rx_bytes: num(r + '-rx_bytes'),
+                          tx_attempts: num(r + '-wifi_tx_attempts'),
+                          tx_dropped: num(r + '-wifi_tx_dropped'),
+                          rx_dropped: num(w + '-rx_dropped')
+                      });
+                  }
+
+                  var lu = d.last_uplink || {}, up = d.uplink || {};
+                  var lldp = (d.lldp_table && d.lldp_table.length) ? d.lldp_table[0] : {};
+                  var parentMac = lu.uplink_mac || up.uplink_mac || lldp.chassis_id || '';
+                  var uplink = {
+                      parent: lu.uplink_device_name || up.uplink_device_name || lldp.chassis_name || lldp.system_name || parentMac || 'unknown',
+                      parent_mac: parentMac || 'unknown',
+                      parent_info: lldp.chassis_descr ? String(lldp.chassis_descr).split('\n')[0] : 'n/a',
+                      port: lu.uplink_remote_port || up.uplink_remote_port || lldp.port_id || 'n/a',
+                      type: up.type || lu.type || 'unknown',
+                      speed: up.speed || 0,
+                      rx_packets: up.rx_packets || 0,
+                      rx_bytes: up.rx_bytes || 0,
+                      tx_packets: up.tx_packets || 0,
+                      tx_bytes: up.tx_bytes || 0
+                  };
+
+                  return JSON.stringify({
+                      uplink: uplink,
+                      satisfaction: d.satisfaction,
+                      num_sta: d.num_sta,
+                      guest_num_sta: d['guest-num_sta'] || 0,
+                      radios: radios
+                  });
+          url: https://{$UNIFI_NETWORK_API_ADDRESS}/proxy/network/api/s/{$SITE.REF}/stat/device/{$AP.MAC}
+          headers:
+            - name: Accept
+              value: application/json
+            - name: X-API-KEY
+              value: '{$UNIFI_NETWORK_API_KEY}'
+          description: Internal UniFi Network API stat/device. Preprocessing keeps only radio metrics (device keys are dropped).
+          tags:
+            - tag: UniFi Component
+              value: Raw
+        - uuid: f9a49ed3b9764b4cba05167aada46518
+          name: Wi-Fi Experience
+          type: DEPENDENT
+          key: satisfaction
+          delay: '0'
+          history: '{$ITEM_RADIO_HISTORY}'
+          units: '%'
+          description: UniFi WiFi Experience (satisfaction), -1 = no clients.
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.satisfaction
+          master_item:
+            key: stat.json
+          tags:
+            - tag: UniFi Component
+              value: Clients
+        - uuid: 1e1f9ffa2b644f79a55652fabe214910
+          name: Clients Guest
+          type: DEPENDENT
+          key: ap.clients.guest
+          delay: '0'
+          history: '{$ITEM_AP.CLIENTS_HISTORY}'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.guest_num_sta
+          master_item:
+            key: stat.json
+          tags:
+            - tag: UniFi Component
+              value: Clients
+        - uuid: 5c4ba71bc15e4b86938f394b934771f5
+          name: Uplink Parent Device
+          type: DEPENDENT
+          key: uplink.parent
+          delay: '0'
+          history: '{$ITEM_UPLINK.INFO_HISTORY}'
+          value_type: CHAR
+          description: UniFi device name, LLDP system name or MAC of the upstream device
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.uplink.parent
+            - &id001
+              type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1h
+          master_item:
+            key: stat.json
+          tags: &id002
+            - tag: UniFi Component
+              value: Uplink
+          triggers:
+            - uuid: 3ea80da3960f48b0a3edf64da89028b3
+              expression: change(/UniFi Network API - Device/uplink.parent)<>0
+              name: Uplink parent device changed to "{ITEM.VALUE}"
+              priority: INFO
+        - uuid: 3b37a6b9887f4c25a14cf4d6ef931218
+          name: Uplink Parent MAC
+          type: DEPENDENT
+          key: uplink.parent.mac
+          delay: '0'
+          history: '{$ITEM_UPLINK.INFO_HISTORY}'
+          value_type: CHAR
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.uplink.parent_mac
+            - *id001
+          master_item:
+            key: stat.json
+          tags: *id002
+        - uuid: 6e4fb1339a634edaa5861710f5cb92c3
+          name: Uplink Parent Info
+          type: DEPENDENT
+          key: uplink.parent.info
+          delay: '0'
+          history: '{$ITEM_UPLINK.INFO_HISTORY}'
+          value_type: CHAR
+          description: LLDP system description (first line)
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.uplink.parent_info
+            - *id001
+          master_item:
+            key: stat.json
+          tags: *id002
+        - uuid: 76c6078247c143438b6c13cbfef072f3
+          name: Uplink Parent Port
+          type: DEPENDENT
+          key: uplink.parent.port
+          delay: '0'
+          history: '{$ITEM_UPLINK.INFO_HISTORY}'
+          value_type: CHAR
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.uplink.port
+            - *id001
+          master_item:
+            key: stat.json
+          tags: *id002
+        - uuid: 1316bb91a1424312aebeeeaeb4f88968
+          name: Uplink Type
+          type: DEPENDENT
+          key: uplink.type
+          delay: '0'
+          history: '{$ITEM_UPLINK.INFO_HISTORY}'
+          value_type: CHAR
+          description: wire / wireless (mesh)
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.uplink.type
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1d
+          master_item:
+            key: stat.json
+          tags: *id002
+        - uuid: 445250e2fd664d998684a76659e5e660
+          name: Uplink Speed
+          type: DEPENDENT
+          key: uplink.speed
+          delay: '0'
+          history: '{$ITEM_UPLINK_HISTORY}'
+          units: bps
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.uplink.speed
+            - type: MULTIPLIER
+              parameters:
+                - '1000000'
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1h
+          master_item:
+            key: stat.json
+          tags: *id002
+          triggers:
+            - uuid: 1a50a3deb25e4d4d83efdafeb094ec3e
+              expression: last(/UniFi Network API - Device/uplink.speed)<max(/UniFi Network API - Device/uplink.speed,{$TRIGGER_UPLINK_SPEED_PERIOD}) and last(/UniFi Network API - Device/uplink.speed)>0 and last(/UniFi Network API - Device/uplink.type)="wire"
+              name: Uplink speed dropped to {ITEM.LASTVALUE}
+              priority: WARNING
+              description: Wired uplink speed is lower than its maximum over {$TRIGGER_UPLINK_SPEED_PERIOD} (e.g. 1 Gbps -> 100 Mbps). Resolves when speed is restored.
+        - uuid: af69170250b94c60b884f758685efabe
+          name: Uplink Down Packets
+          type: DEPENDENT
+          key: uplink.down.packets
+          delay: '0'
+          history: '{$ITEM_UPLINK_HISTORY}'
+          value_type: FLOAT
+          units: pps
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.uplink.rx_packets
+            - &id003
+              type: CHANGE_PER_SECOND
+              parameters:
+                - ''
+          master_item:
+            key: stat.json
+          tags: *id002
+        - uuid: 2c3edb67356d4d0ea4fbbd4e914acdf3
+          name: Uplink Down Bytes Total
+          type: DEPENDENT
+          key: uplink.down.bytes
+          delay: '0'
+          history: '{$ITEM_UPLINK_HISTORY}'
+          units: B
+          description: Counter since uplink interface start
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.uplink.rx_bytes
+          master_item:
+            key: stat.json
+          tags: *id002
+        - uuid: ce28945b598b40158a34a744534de4d0
+          name: Uplink Up Packets
+          type: DEPENDENT
+          key: uplink.up.packets
+          delay: '0'
+          history: '{$ITEM_UPLINK_HISTORY}'
+          value_type: FLOAT
+          units: pps
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.uplink.tx_packets
+            - *id003
+          master_item:
+            key: stat.json
+          tags: *id002
+        - uuid: 4a53a4c4c1a34c1baa9cd502c878a1b3
+          name: Uplink Up Bytes Total
+          type: DEPENDENT
+          key: uplink.up.bytes
+          delay: '0'
+          history: '{$ITEM_UPLINK_HISTORY}'
+          units: B
+          description: Counter since uplink interface start
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.uplink.tx_bytes
+          master_item:
+            key: stat.json
+          tags: *id002
+        - uuid: eeab80dd14164d789b4d1c2d5e2f5d6d
+          name: 'Anomalies: AP Active'
+          type: DEPENDENT
+          key: ap.anomaly.active
+          delay: '0'
+          history: '{$ITEM_AP.ANOMALY.TEXT_HISTORY}'
+          value_type: CHAR
+          description: UniFi AP anomalies seen within {$ANOMALY_ACTIVE_MIN} minutes, none = no anomaly
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.anomalies.ap_active
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: clients.json
+          tags:
+            - tag: UniFi Component
+              value: Anomalies
+        - uuid: 1532f82956684916a4977e0b8ee2bfad
+          name: 'Anomalies: High Drop Rate Duration'
+          type: DEPENDENT
+          key: ap.anomaly.drop.streak
+          delay: '0'
+          history: '{$ITEM_AP.ANOMALY_HISTORY}'
+          units: min
+          description: How long AP_HIGH_DROP_RATE lasts without interruption, minutes
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.anomalies.ap_drop_streak_min
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: clients.json
+          tags:
+            - tag: UniFi Component
+              value: Anomalies
+          triggers:
+            - uuid: 71ddc23a5a784f6ab9fbd849421ce3bc
+              expression: last(/UniFi Network API - Device/ap.anomaly.drop.streak)>={$TRIGGER_AP_ANOMALY_DROP_TIME}
+              name: AP high drop rate for {ITEM.LASTVALUE} (UniFi anomaly)
+              priority: WARNING
+        - uuid: 584726dfdcca4e61bbae48d2a9529e6d
+          name: 'Anomalies: Long Association (1h)'
+          type: DEPENDENT
+          key: ap.anomaly.longassoc
+          delay: '0'
+          history: '{$ITEM_AP.ANOMALY_HISTORY}'
+          description: 5-minute intervals with AP_LONG_MAX_ASSOCIATION_TIME in the last hour
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.anomalies.ap_long_assoc_1h
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: clients.json
+          tags:
+            - tag: UniFi Component
+              value: Anomalies
+          triggers:
+            - uuid: 43b1f16988314fc583a14452046943a2
+              expression: last(/UniFi Network API - Device/ap.anomaly.longassoc)>={$TRIGGER_AP_ANOMALY_LONGASSOC_COUNT}
+              name: 'Clients connect slowly to AP: {ITEM.LASTVALUE} times in 1h (UniFi anomaly)'
+              priority: WARNING
+        - uuid: c7c9e1a220224ba59ef54d3e2fdad9a0
+          name: 'Anomalies: Clients with Anomalies'
+          type: DEPENDENT
+          key: ap.anomaly.clients.count
+          delay: '0'
+          history: '{$ITEM_AP.ANOMALY_HISTORY}'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.anomalies.clients_count
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: clients.json
+          tags:
+            - tag: UniFi Component
+              value: Anomalies
+        - uuid: d310277eb5464c9c947808d02a125839
+          name: 'Anomalies: Clients with Anomalies %'
+          type: DEPENDENT
+          key: ap.anomaly.clients.pct
+          delay: '0'
+          history: '{$ITEM_AP.ANOMALY_HISTORY}'
+          value_type: FLOAT
+          units: '%'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.anomalies.clients_pct
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: clients.json
+          tags:
+            - tag: UniFi Component
+              value: Anomalies
+          triggers:
+            - uuid: 400cfbb2dd454e539c9dd8aadea99db7
+              expression: min(/UniFi Network API - Device/ap.anomaly.clients.pct,{$TRIGGER_AP_ANOMALY_ZONE_TIME})>={$TRIGGER_AP_ANOMALY_ZONE_PCT} and min(/UniFi Network API - Device/ap.anomaly.clients.count,{$TRIGGER_AP_ANOMALY_ZONE_TIME})>={$TRIGGER_AP_ANOMALY_ZONE_MIN}
+              name: 'Wi-Fi zone problem: {ITEM.LASTVALUE2} clients ({ITEM.LASTVALUE1}%) with anomalies for {$TRIGGER_AP_ANOMALY_ZONE_TIME}'
+              priority: WARNING
+              description: 'Many clients of this AP have UniFi anomalies at the same time: the problem is likely the AP zone, not the clients.'
+        - uuid: 4225c90bd0bc4dc09ddcd5b6208ff57b
+          name: 'Anomalies: Clients List'
+          type: DEPENDENT
+          key: ap.anomaly.clients.list
+          delay: '0'
+          history: '{$ITEM_AP.ANOMALY.TEXT_HISTORY}'
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.anomalies.clients_list
+              error_handler: DISCARD_VALUE
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1h
+          master_item:
+            key: clients.json
+          tags:
+            - tag: UniFi Component
+              value: Anomalies
+      discovery_rules:
+        - uuid: a18e1e6ead84446bbf1b8c8598733fb9
+          name: Discovery Radios
+          type: DEPENDENT
+          key: discovery.radio
+          delay: '0'
+          item_prototypes:
+            - uuid: e38e02754f324135b6693f17efe2bca7
+              name: 'Radio {#BAND}: State'
+              type: DEPENDENT
+              key: radio.state[{#RADIO}]
+              delay: '0'
+              history: '{$ITEM_RADIO_HISTORY}'
+              value_type: CHAR
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.radios[?(@.radio=='{#RADIO}')].state.first()
+              master_item:
+                key: stat.json
+              tags:
+                - tag: UniFi Component
+                  value: Radio
+                - tag: UniFi Radio
+                  value: '{#BAND}'
+              trigger_prototypes:
+                - uuid: c71488b4b61d46378e2a5e5d3166f2cc
+                  expression: count(/UniFi Network API - Device/radio.state[{#RADIO}],{$TRIGGER_RADIO_STATE_TIME},"eq","RUN")=0 and count(/UniFi Network API - Device/radio.state[{#RADIO}],{$TRIGGER_RADIO_STATE_TIME})>0
+                  name: Radio {#BAND} state is "{ITEM.LASTVALUE}" for {$TRIGGER_RADIO_STATE_TIME}
+                  priority: AVERAGE
+                  description: Radio was never in RUN state during the period (short INIT after reboot, channel change or DFS CAC is ignored).
+            - uuid: 2e1d2943a4d149748e8fcd9b0e49e4ae
+              name: 'Radio {#BAND}: Channel'
+              type: DEPENDENT
+              key: radio.channel[{#RADIO}]
+              delay: '0'
+              history: '{$ITEM_RADIO_HISTORY}'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.radios[?(@.radio=='{#RADIO}')].channel.first()
+              master_item:
+                key: stat.json
+              tags:
+                - tag: UniFi Component
+                  value: Radio
+                - tag: UniFi Radio
+                  value: '{#BAND}'
+            - uuid: 7dee5e16bf6f4db2983bcbb2c07d2032
+              name: 'Radio {#BAND}: Channel Width'
+              type: DEPENDENT
+              key: radio.channel.width[{#RADIO}]
+              delay: '0'
+              history: '{$ITEM_RADIO_HISTORY}'
+              units: MHz
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.radios[?(@.radio=='{#RADIO}')].bw.first()
+                - type: DISCARD_UNCHANGED_HEARTBEAT
+                  parameters:
+                    - 1h
+              master_item:
+                key: stat.json
+              tags:
+                - tag: UniFi Component
+                  value: Radio
+                - tag: UniFi Radio
+                  value: '{#BAND}'
+            - uuid: 39fb90cf018048bdab4190cf83b498c6
+              name: 'Radio {#BAND}: Transmit Power'
+              type: DEPENDENT
+              key: radio.tx.power[{#RADIO}]
+              delay: '0'
+              history: '{$ITEM_RADIO_HISTORY}'
+              units: dBm
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.radios[?(@.radio=='{#RADIO}')].tx_power.first()
+              master_item:
+                key: stat.json
+              tags:
+                - tag: UniFi Component
+                  value: Radio
+                - tag: UniFi Radio
+                  value: '{#BAND}'
+            - uuid: 723b439c5a3a4a4db18aa7877f36eada
+              name: 'Radio {#BAND}: EIRP'
+              type: DEPENDENT
+              key: radio.eirp[{#RADIO}]
+              delay: '0'
+              history: '{$ITEM_RADIO_HISTORY}'
+              units: dBm
+              description: Transmit Power + Antenna Gain
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.radios[?(@.radio=='{#RADIO}')].eirp.first()
+                - type: DISCARD_UNCHANGED_HEARTBEAT
+                  parameters:
+                    - 1d
+              master_item:
+                key: stat.json
+              tags:
+                - tag: UniFi Component
+                  value: Radio
+                - tag: UniFi Radio
+                  value: '{#BAND}'
+            - uuid: c4f669b575f8477da7d205d195f70ef3
+              name: 'Radio {#BAND}: Antenna Gain'
+              type: DEPENDENT
+              key: radio.antenna.gain[{#RADIO}]
+              delay: '0'
+              history: '{$ITEM_RADIO_HISTORY}'
+              units: dBi
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.radios[?(@.radio=='{#RADIO}')].antenna_gain.first()
+                - type: DISCARD_UNCHANGED_HEARTBEAT
+                  parameters:
+                    - 1d
+              master_item:
+                key: stat.json
+              tags:
+                - tag: UniFi Component
+                  value: Radio
+                - tag: UniFi Radio
+                  value: '{#BAND}'
+            - uuid: bd0758574b314cda86ee8e2409415bb5
+              name: 'Radio {#BAND}: Clients'
+              type: DEPENDENT
+              key: radio.clients[{#RADIO}]
+              delay: '0'
+              history: '{$ITEM_RADIO_HISTORY}'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.radios[?(@.radio=='{#RADIO}')].num_sta.first()
+              master_item:
+                key: stat.json
+              tags:
+                - tag: UniFi Component
+                  value: Clients
+                - tag: UniFi Radio
+                  value: '{#BAND}'
+            - uuid: cb557a92c2274302b43eae9d258ddee2
+              name: 'Radio {#BAND}: Clients Guest'
+              type: DEPENDENT
+              key: radio.clients.guest[{#RADIO}]
+              delay: '0'
+              history: '{$ITEM_RADIO_HISTORY}'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.radios[?(@.radio=='{#RADIO}')].guest_num_sta.first()
+              master_item:
+                key: stat.json
+              tags:
+                - tag: UniFi Component
+                  value: Clients
+                - tag: UniFi Radio
+                  value: '{#BAND}'
+            - uuid: 12d3fbe18e104a3f90c256f1888c8f82
+              name: 'Radio {#BAND}: Wi-Fi Experience'
+              type: DEPENDENT
+              key: radio.satisfaction[{#RADIO}]
+              delay: '0'
+              history: '{$ITEM_RADIO_HISTORY}'
+              units: '%'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.radios[?(@.radio=='{#RADIO}')].satisfaction.first()
+              master_item:
+                key: stat.json
+              tags:
+                - tag: UniFi Component
+                  value: Radio
+                - tag: UniFi Radio
+                  value: '{#BAND}'
+            - uuid: 0846d572daef4840b128a55ac053bbeb
+              name: 'Radio {#BAND}: Channel Utilization Busy'
+              type: DEPENDENT
+              key: radio.cu.busy[{#RADIO}]
+              delay: '0'
+              history: '{$ITEM_RADIO_HISTORY}'
+              units: '%'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.radios[?(@.radio=='{#RADIO}')].cu_total.first()
+              master_item:
+                key: stat.json
+              tags:
+                - tag: UniFi Component
+                  value: Radio
+                - tag: UniFi Radio
+                  value: '{#BAND}'
+              trigger_prototypes:
+                - uuid: fdc9a5a1ce35496fa20deaa7c841e0e6
+                  expression: min(/UniFi Network API - Device/radio.cu.busy[{#RADIO}],{$TRIGGER_CU_TIME})>{$TRIGGER_CU_HIGH:"{#BAND}"}
+                  name: Radio {#BAND} channel utilization > {$TRIGGER_CU_HIGH:"{#BAND}"}% for {$TRIGGER_CU_TIME}
+                  priority: AVERAGE
+                - uuid: 5db54cee4b924d32aec8d881d1df99ef
+                  expression: min(/UniFi Network API - Device/radio.cu.busy[{#RADIO}],{$TRIGGER_CU_TIME})>{$TRIGGER_CU_WARNING:"{#BAND}"}
+                  name: Radio {#BAND} channel utilization > {$TRIGGER_CU_WARNING:"{#BAND}"}% for {$TRIGGER_CU_TIME}
+                  priority: WARNING
+                  dependencies:
+                    - name: Radio {#BAND} channel utilization > {$TRIGGER_CU_HIGH:"{#BAND}"}% for {$TRIGGER_CU_TIME}
+                      expression: min(/UniFi Network API - Device/radio.cu.busy[{#RADIO}],{$TRIGGER_CU_TIME})>{$TRIGGER_CU_HIGH:"{#BAND}"}
+            - uuid: 56a8fd463c2342fba95875c802719d35
+              name: 'Radio {#BAND}: Channel Utilization Rx'
+              type: DEPENDENT
+              key: radio.cu.rx[{#RADIO}]
+              delay: '0'
+              history: '{$ITEM_RADIO_HISTORY}'
+              units: '%'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.radios[?(@.radio=='{#RADIO}')].cu_self_rx.first()
+              master_item:
+                key: stat.json
+              tags:
+                - tag: UniFi Component
+                  value: Radio
+                - tag: UniFi Radio
+                  value: '{#BAND}'
+            - uuid: 094066361387485cafa0ed8aa8fe07ea
+              name: 'Radio {#BAND}: Channel Utilization Tx'
+              type: DEPENDENT
+              key: radio.cu.tx[{#RADIO}]
+              delay: '0'
+              history: '{$ITEM_RADIO_HISTORY}'
+              units: '%'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.radios[?(@.radio=='{#RADIO}')].cu_self_tx.first()
+              master_item:
+                key: stat.json
+              tags:
+                - tag: UniFi Component
+                  value: Radio
+                - tag: UniFi Radio
+                  value: '{#BAND}'
+            - uuid: bfeebd7466e44f77bde1c531cebfd1b0
+              name: 'Radio {#BAND}: Tx Retry'
+              type: DEPENDENT
+              key: radio.tx.retry.pct[{#RADIO}]
+              delay: '0'
+              history: '{$ITEM_RADIO_HISTORY}'
+              value_type: FLOAT
+              units: '%'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.radios[?(@.radio=='{#RADIO}')].tx_retries_pct.first()
+              master_item:
+                key: stat.json
+              tags:
+                - tag: UniFi Component
+                  value: Radio
+                - tag: UniFi Radio
+                  value: '{#BAND}'
+              trigger_prototypes:
+                - uuid: 5e07541b137b4dca8ffa2aeced82dbb3
+                  expression: min(/UniFi Network API - Device/radio.tx.retry.pct[{#RADIO}],{$TRIGGER_TXRETRIES_TIME})>{$TRIGGER_TXRETRIES_AVERAGE:"{#BAND}"} and avg(/UniFi Network API - Device/radio.tx.packets[{#RADIO}],{$TRIGGER_TXRETRIES_TIME})>{$TRIGGER_TXRETRIES_MIN_PPS}
+                  name: Radio {#BAND} Tx Retry > {$TRIGGER_TXRETRIES_AVERAGE:"{#BAND}"}% for {$TRIGGER_TXRETRIES_TIME}
+                  priority: AVERAGE
+                  description: Retries stay above threshold for the whole period while the radio carries traffic (low-traffic periods are ignored).
+                - uuid: b30eea56420145a0b3060916d0756aa1
+                  expression: avg(/UniFi Network API - Device/radio.tx.retry.pct[{#RADIO}],{$TRIGGER_TXRETRIES_TIME})>{$TRIGGER_TXRETRIES_WARNING:"{#BAND}"} and avg(/UniFi Network API - Device/radio.tx.packets[{#RADIO}],{$TRIGGER_TXRETRIES_TIME})>{$TRIGGER_TXRETRIES_MIN_PPS}
+                  name: Radio {#BAND} Tx Retry avg > {$TRIGGER_TXRETRIES_WARNING:"{#BAND}"}% for {$TRIGGER_TXRETRIES_TIME}
+                  priority: WARNING
+                  dependencies:
+                    - name: Radio {#BAND} Tx Retry > {$TRIGGER_TXRETRIES_AVERAGE:"{#BAND}"}% for {$TRIGGER_TXRETRIES_TIME}
+                      expression: min(/UniFi Network API - Device/radio.tx.retry.pct[{#RADIO}],{$TRIGGER_TXRETRIES_TIME})>{$TRIGGER_TXRETRIES_AVERAGE:"{#BAND}"} and avg(/UniFi Network API - Device/radio.tx.packets[{#RADIO}],{$TRIGGER_TXRETRIES_TIME})>{$TRIGGER_TXRETRIES_MIN_PPS}
+            - uuid: bc7dd2b6d29c465db4ba69a4a36e6bfc
+              name: 'Radio {#BAND}: Tx Packets'
+              type: DEPENDENT
+              key: radio.tx.packets[{#RADIO}]
+              delay: '0'
+              history: '{$ITEM_RADIO_HISTORY}'
+              value_type: FLOAT
+              units: pps
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.radios[?(@.radio=='{#RADIO}')].tx_packets.first()
+                - &id004
+                  type: CHANGE_PER_SECOND
+                  parameters:
+                    - ''
+              master_item:
+                key: stat.json
+              tags:
+                - tag: UniFi Component
+                  value: Radio
+                - tag: UniFi Radio
+                  value: '{#BAND}'
+            - uuid: 3856f4fac47a48f08014960d75f4699d
+              name: 'Radio {#BAND}: Tx Bytes'
+              type: DEPENDENT
+              key: radio.tx.bytes[{#RADIO}]
+              delay: '0'
+              history: '{$ITEM_RADIO_HISTORY}'
+              value_type: FLOAT
+              units: Bps
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.radios[?(@.radio=='{#RADIO}')].tx_bytes.first()
+                - *id004
+              master_item:
+                key: stat.json
+              tags:
+                - tag: UniFi Component
+                  value: Radio
+                - tag: UniFi Radio
+                  value: '{#BAND}'
+            - uuid: 7cc08106ab3f4e669172a8cae4f46487
+              name: 'Radio {#BAND}: Rx Packets'
+              type: DEPENDENT
+              key: radio.rx.packets[{#RADIO}]
+              delay: '0'
+              history: '{$ITEM_RADIO_HISTORY}'
+              value_type: FLOAT
+              units: pps
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.radios[?(@.radio=='{#RADIO}')].rx_packets.first()
+                - *id004
+              master_item:
+                key: stat.json
+              tags:
+                - tag: UniFi Component
+                  value: Radio
+                - tag: UniFi Radio
+                  value: '{#BAND}'
+            - uuid: 107c700cb56a428e9faa34d73b319b9b
+              name: 'Radio {#BAND}: Rx Bytes'
+              type: DEPENDENT
+              key: radio.rx.bytes[{#RADIO}]
+              delay: '0'
+              history: '{$ITEM_RADIO_HISTORY}'
+              value_type: FLOAT
+              units: Bps
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.radios[?(@.radio=='{#RADIO}')].rx_bytes.first()
+                - *id004
+              master_item:
+                key: stat.json
+              tags:
+                - tag: UniFi Component
+                  value: Radio
+                - tag: UniFi Radio
+                  value: '{#BAND}'
+            - uuid: f52eb53c4ed2412ead89da18a5cf714f
+              name: 'Radio {#BAND}: Tx Attempts (raw rate)'
+              type: DEPENDENT
+              key: radio.tx.attempts[{#RADIO}]
+              delay: '0'
+              history: '{$ITEM_RADIO.RAW_HISTORY}'
+              value_type: FLOAT
+              units: pps
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.radios[?(@.radio=='{#RADIO}')].tx_attempts.first()
+                - *id004
+              master_item:
+                key: stat.json
+              tags:
+                - tag: UniFi Component
+                  value: Radio
+                - tag: UniFi Radio
+                  value: '{#BAND}'
+            - uuid: 3aed7fac46df4f7494951ba9a21d08a1
+              name: 'Radio {#BAND}: Tx Dropped (raw rate)'
+              type: DEPENDENT
+              key: radio.tx.dropped[{#RADIO}]
+              delay: '0'
+              history: '{$ITEM_RADIO.RAW_HISTORY}'
+              value_type: FLOAT
+              units: pps
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.radios[?(@.radio=='{#RADIO}')].tx_dropped.first()
+                - *id004
+              master_item:
+                key: stat.json
+              tags:
+                - tag: UniFi Component
+                  value: Radio
+                - tag: UniFi Radio
+                  value: '{#BAND}'
+            - uuid: c1e1444d310d429cbe5b60b26b570a77
+              name: 'Radio {#BAND}: Rx Dropped (raw rate)'
+              type: DEPENDENT
+              key: radio.rx.dropped[{#RADIO}]
+              delay: '0'
+              history: '{$ITEM_RADIO.RAW_HISTORY}'
+              value_type: FLOAT
+              units: pps
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.radios[?(@.radio=='{#RADIO}')].rx_dropped.first()
+                - *id004
+              master_item:
+                key: stat.json
+              tags:
+                - tag: UniFi Component
+                  value: Radio
+                - tag: UniFi Radio
+                  value: '{#BAND}'
+            - uuid: 07ad3fc33fd74742b6ca19274517cb56
+              name: 'Radio {#BAND}: Tx Dropped'
+              type: CALCULATED
+              key: radio.tx.dropped.pct[{#RADIO}]
+              delay: '{$ITEM_STAT.JSON_UPDATE}'
+              history: '{$ITEM_RADIO_HISTORY}'
+              value_type: FLOAT
+              units: '%'
+              params: 100*last(//radio.tx.dropped[{#RADIO}])/(last(//radio.tx.attempts[{#RADIO}])+0.000001)
+              description: Percentage over the last polling interval.
+              tags:
+                - tag: UniFi Component
+                  value: Radio
+                - tag: UniFi Radio
+                  value: '{#BAND}'
+            - uuid: 44fcf9d250d44db7b0c096757e19a2ff
+              name: 'Radio {#BAND}: Rx Dropped'
+              type: CALCULATED
+              key: radio.rx.dropped.pct[{#RADIO}]
+              delay: '{$ITEM_STAT.JSON_UPDATE}'
+              history: '{$ITEM_RADIO_HISTORY}'
+              value_type: FLOAT
+              units: '%'
+              params: 100*last(//radio.rx.dropped[{#RADIO}])/(last(//radio.rx.packets[{#RADIO}])+0.000001)
+              description: Percentage over the last polling interval.
+              tags:
+                - tag: UniFi Component
+                  value: Radio
+                - tag: UniFi Radio
+                  value: '{#BAND}'
+          master_item:
+            key: stat.json
+          lld_macro_paths:
+            - lld_macro: '{#RADIO}'
+              path: $.radio
+            - lld_macro: '{#BAND}'
+              path: $.band
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.radios
+      macros:
+        - macro: '{$ANOMALY_ACTIVE_MIN}'
+          value: '15'
+          description: Anomaly is active if seen within this many minutes
+        - macro: '{$ANOMALY_IGNORE}'
+          value: ''
+          description: Anomaly types to ignore, comma separated (e.g. USER_DNS_TIMEOUT)
+        - macro: '{$AP.MAC}'
+          description: AP MAC. Filled by discovery, DO NOT CHANGE OR DELETE.
+        - macro: '{$ITEM_AP.ANOMALY.TEXT_HISTORY}'
+          value: 7d
+          description: Anomaly text items History
+        - macro: '{$ITEM_AP.ANOMALY_HISTORY}'
+          value: 30d
+          description: Anomaly numeric items History
+        - macro: '{$ITEM_AP.CLIENTS.LIST_HISTORY}'
+          value: 1d
+          description: Item 'ap.clients.list' History
+        - macro: '{$ITEM_AP.CLIENTS_HISTORY}'
+          value: 30d
+          description: Items 'ap.clients.total/avg_duration' History
+        - macro: '{$ITEM_CLIENTS.JSON_UPDATE}'
+          value: 5m
+          description: Item 'clients.json' Update Interval
+        - macro: '{$ITEM_CPU.UTILIZATION_HISTORY}'
+          value: 7d
+          description: Item 'cpu.utilization' History
+        - macro: '{$ITEM_DETAILS.JSON_UPDATE}'
+          value: 10m
+          description: Item 'details.json' Update Interval
+        - macro: '{$ITEM_FIRMWARE.VERSION_HISTORY}'
+          value: 1h
+          description: Item 'firmware.version' History
+        - macro: '{$ITEM_IP_HISTORY}'
+          value: 1h
+          description: Item 'ip' History
+        - macro: '{$ITEM_LOADAVG_HISTORY}'
+          value: 7d
+          description: Item 'loadAverage1Min' History
+        - macro: '{$ITEM_MACADDRESS_HISTORY}'
+          value: 1h
+          description: Item 'macaddress' History
+        - macro: '{$ITEM_MEMORY.UTILIZATION_HISTORY}'
+          value: 7d
+          description: Item 'memory.utilization' History
+        - macro: '{$ITEM_MODEL_HISTORY}'
+          value: 1h
+          description: Item 'model' History
+        - macro: '{$ITEM_NAME_HISTORY}'
+          value: 1h
+          description: Item 'name' History
+        - macro: '{$ITEM_RADIO.RAW_HISTORY}'
+          value: 1d
+          description: Raw counter rates used for Dropped % History
+        - macro: '{$ITEM_RADIO_HISTORY}'
+          value: 30d
+          description: Radio items History
+        - macro: '{$ITEM_STAT.JSON_UPDATE}'
+          value: 2m
+          description: Item 'stat.json' Update Interval (radio details)
+        - macro: '{$ITEM_STATE_HISTORY}'
+          value: 1h
+          description: Item 'state' History
+        - macro: '{$ITEM_STATISTICS.JSON_UPDATE}'
+          value: 5m
+          description: Item 'statistics.json' Update Interval
+        - macro: '{$ITEM_UPLINK.INFO_HISTORY}'
+          value: 30d
+          description: Uplink text items History
+        - macro: '{$ITEM_UPLINK_HISTORY}'
+          value: 7d
+          description: Item 'uplink' History
+        - macro: '{$ITEM_UPTIME_HISTORY}'
+          value: 7d
+          description: Item 'uptime' History
+        - macro: '{$SITE.ID}'
+          description: Site ID. Filled by discovery, DO NOT CHANGE OR DELETE.
+        - macro: '{$SITE.NAME}'
+          description: Site NAME. Filled by discovery, DO NOT CHANGE OR DELETE.
+        - macro: '{$SITE.REF}'
+          description: Site short name (internalReference). Filled by discovery, DO NOT CHANGE OR DELETE.
+        - macro: '{$TRIGGER_AP_ANOMALY_DROP_TIME}'
+          value: '15'
+          description: AP_HIGH_DROP_RATE alert after this many minutes
+        - macro: '{$TRIGGER_AP_ANOMALY_LONGASSOC_COUNT}'
+          value: '3'
+          description: 'Slow association alert: intervals per hour'
+        - macro: '{$TRIGGER_AP_ANOMALY_ZONE_MIN}'
+          value: '3'
+          description: 'Zone problem: minimum number of clients with anomalies'
+        - macro: '{$TRIGGER_AP_ANOMALY_ZONE_PCT}'
+          value: '30'
+          description: 'Zone problem: % of AP clients with anomalies'
+        - macro: '{$TRIGGER_AP_ANOMALY_ZONE_TIME}'
+          value: 15m
+          description: Zone problem must last this long
+        - macro: '{$TRIGGER_AP_CLIENTS_HIGH}'
+          value: '40'
+          description: 'Trigger: max wireless clients per AP'
+        - macro: '{$TRIGGER_AP_CLIENTS_TIME}'
+          value: 15m
+          description: 'Trigger: clients above threshold for this period'
+        - macro: '{$TRIGGER_CPUUTIL_AVERAGE}'
+          value: '90'
+          description: Trigger 'CPU Utilization' % trigger
+        - macro: '{$TRIGGER_CPUUTIL_WARNING}'
+          value: '80'
+          description: Trigger 'CPU Utilization' % trigger
+        - macro: '{$TRIGGER_CU_HIGH:"2.4GHz"}'
+          value: '80'
+          description: Channel utilization Average %, 2.4GHz
+        - macro: '{$TRIGGER_CU_HIGH}'
+          value: '70'
+          description: Channel utilization Average %, default (5GHz/6GHz)
+        - macro: '{$TRIGGER_CU_TIME}'
+          value: 15m
+          description: Channel utilization period
+        - macro: '{$TRIGGER_CU_WARNING:"2.4GHz"}'
+          value: '60'
+          description: Channel utilization Warning %, 2.4GHz
+        - macro: '{$TRIGGER_CU_WARNING}'
+          value: '50'
+          description: Channel utilization Warning %, default (5GHz/6GHz)
+        - macro: '{$TRIGGER_MEMUTIL_AVERAGE}'
+          value: '90'
+          description: Trigger 'Memory Utilization' % trigger
+        - macro: '{$TRIGGER_MEMUTIL_WARNING}'
+          value: '80'
+          description: Trigger 'Memory Utilization' % trigger
+        - macro: '{$TRIGGER_RADIO_STATE_TIME}'
+          value: 10m
+          description: Radio state trigger fires only if the radio is not RUN for this whole period
+        - macro: '{$TRIGGER_TXRETRIES_AVERAGE:"2.4GHz"}'
+          value: '40'
+          description: Tx Retry Average %, 2.4GHz
+        - macro: '{$TRIGGER_TXRETRIES_AVERAGE}'
+          value: '25'
+          description: Tx Retry Average %, default (5GHz/6GHz)
+        - macro: '{$TRIGGER_TXRETRIES_MIN_PPS}'
+          value: '20'
+          description: Tx Retry triggers fire only if radio avg Tx > this many packets/s
+        - macro: '{$TRIGGER_TXRETRIES_TIME}'
+          value: 1h
+          description: Tx Retry evaluation period
+        - macro: '{$TRIGGER_TXRETRIES_WARNING:"2.4GHz"}'
+          value: '25'
+          description: Tx Retry Warning %, 2.4GHz
+        - macro: '{$TRIGGER_TXRETRIES_WARNING}'
+          value: '15'
+          description: Tx Retry Warning %, default (5GHz/6GHz)
+        - macro: '{$TRIGGER_UPLINK_SPEED_PERIOD}'
+          value: 7d
+          description: Uplink speed is compared with its maximum over this period
+      description: 'UniFi Access Point: load, radios and wireless clients connected to this AP. {HOST.HOST} = device id.'
+    - uuid: d42f2e59a92b4d22a52b99ee35f7ce5f
+      template: UniFi Network API - Site
+      name: UniFi Network API - Site
+      groups:
+        - name: Templates/Network devices
+      items:
+        - uuid: bc7f018c55de40f6b0bdf2aa66f6d333
+          name: Wireless Clients JSON
+          type: SCRIPT
+          key: clients.json
+          delay: '{$ITEM_CLIENTS.JSON_UPDATE}'
+          history: '0'
+          value_type: TEXT
+          params: |
+            var p = JSON.parse(value);
+            var base = 'https://' + p.address + '/proxy/network/integration/v1/sites/' + p.site_id + '/clients';
+            var limit = 200, offset = 0, total = 0, pages = 0, out = [], j;
+
+            var req = new HttpRequest();
+            req.addHeader('Accept: application/json');
+            req.addHeader('X-API-KEY: ' + p.api_key);
+
+            do {
+                var resp = req.get(base + '?limit=' + limit + '&offset=' + offset);
+                if (req.getStatus() != 200) {
+                    throw 'UniFi API HTTP ' + req.getStatus() + ': ' + String(resp).substring(0, 200);
+                }
+                j = JSON.parse(resp);
+                total = j.totalCount;
+                for (var i = 0; i < j.data.length; i++) {
+                    var c = j.data[i];
+                    if (c.type !== 'WIRELESS') continue;
+                    if (p.device_id && c.uplinkDeviceId !== p.device_id) continue;
+                    out.push({
+                        id: c.id,
+                        name: c.name,
+                        ip: c.ipAddress,
+                        mac: c.macAddress,
+                        connectedAt: c.connectedAt,
+                        uplinkDeviceId: c.uplinkDeviceId,
+                        access: c.access ? c.access.type : null
+                    });
+                }
+                offset += j.data.length;
+                pages++;
+            } while (j.data.length > 0 && offset < total && pages < 50);
+
+            return JSON.stringify(out);
+          timeout: 60s
+          parameters:
+            - name: address
+              value: '{$UNIFI_NETWORK_API_ADDRESS}'
+            - name: api_key
+              value: '{$UNIFI_NETWORK_API_KEY}'
+            - name: site_id
+              value: '{$SITE.ID}'
+          description: All WIRELESS clients of the site, paginated (200 per request).
+          tags:
+            - tag: UniFi Component
+              value: Raw
+        - uuid: bde0f31d0901467fbc7a301fc6eb58d9
+          name: Clients Wireless
+          type: DEPENDENT
+          key: clients.wireless
+          delay: '0'
+          history: '{$ITEM_CLIENTS.WIRELESS_HISTORY}'
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  return JSON.parse(value).length;
+          master_item:
+            key: clients.json
+          tags:
+            - tag: UniFi Component
+              value: Clients
+        - uuid: c013d47d65e240e7bf5f682d04ded20d
+          name: Devices JSON (Access Points only)
+          type: HTTP_AGENT
+          key: devices.json
+          delay: '{$ITEM_DEVICES.JSON_UPDATE}'
+          history: '0'
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.data
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var site_name = '{$SITE.NAME}';
+                  var site_id = '{$SITE.ID}';
+                  var obj = JSON.parse(value);
+                  var out = [];
+
+                  for (var i = 0; i < obj.length; i++) {
+                      var f = obj[i].features || [];
+                      if (f.indexOf('accessPoint') === -1) continue;
+                      obj[i].site_name = site_name;
+                      obj[i].site_id = site_id;
+                      out.push(obj[i]);
+                  }
+
+                  return JSON.stringify(out);
+          url: https://{$UNIFI_NETWORK_API_ADDRESS}/proxy/network/integration/v1/sites/{HOST.HOST}/devices
+          query_fields:
+            - name: limit
+              value: '200'
+          headers:
+            - name: Accept
+              value: application/json
+            - name: X-API-KEY
+              value: '{$UNIFI_NETWORK_API_KEY}'
+          tags:
+            - tag: UniFi Component
+              value: Raw
+        - uuid: 95df7af44f2949b99fc2ae8f887b23ba
+          name: Access Points Total
+          type: DEPENDENT
+          key: aps.total
+          delay: '0'
+          history: '{$ITEM_APS_HISTORY}'
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  return JSON.parse(value).length;
+          master_item:
+            key: devices.json
+          tags:
+            - tag: UniFi Component
+              value: Access Points
+        - uuid: 66126c878ea1493ea98d534829a38797
+          name: Access Points Online
+          type: DEPENDENT
+          key: aps.online
+          delay: '0'
+          history: '{$ITEM_APS_HISTORY}'
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var a = JSON.parse(value), n = 0;
+                  for (var i = 0; i < a.length; i++) {
+                      if (a[i].state === 'ONLINE') n++;
+                  }
+                  return n;
+          master_item:
+            key: devices.json
+          tags:
+            - tag: UniFi Component
+              value: Access Points
+        - uuid: 18023f82be7545829666be62c1de5ae9
+          name: Access Points Offline
+          type: DEPENDENT
+          key: aps.offline
+          delay: '0'
+          history: '{$ITEM_APS_HISTORY}'
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var a = JSON.parse(value), n = 0;
+                  for (var i = 0; i < a.length; i++) {
+                      if (a[i].state !== 'ONLINE') n++;
+                  }
+                  return n;
+          master_item:
+            key: devices.json
+          tags:
+            - tag: UniFi Component
+              value: Access Points
+      macros:
+        - macro: '{$ITEM_APS_HISTORY}'
+          value: 7d
+          description: Items 'aps.*' History
+        - macro: '{$ITEM_CLIENTS.JSON_UPDATE}'
+          value: 5m
+          description: Item 'clients.json' Update Interval
+        - macro: '{$ITEM_CLIENTS.WIRELESS_HISTORY}'
+          value: 7d
+          description: Item 'clients.wireless' History
+        - macro: '{$ITEM_DEVICES.JSON_UPDATE}'
+          value: 10m
+          description: Item 'devices.json' Update Interval
+        - macro: '{$SITE.ID}'
+          description: Site ID. Used by Template, DO NOT CHANGE OR DELETE.
+        - macro: '{$SITE.NAME}'
+          description: Site NAME. Used by Template, DO NOT CHANGE OR DELETE.
