@@ -6,7 +6,7 @@
 
 Zabbix 7.0 template for monitoring **UniFi Network**. It automatically finds every site and every access point on the controller and monitors them. It connects with an **API key**, and the key can be stored in **HashiCorp Vault**.
 
-- **Version:** 1.0.0
+- **Version:** 1.1.0
 - **Zabbix:** 7.0
 - **License:** MIT
 - **Author:** AspidovSS
@@ -30,6 +30,7 @@ This is a fork of [MassimilianoPasquini97/zbx_unifi_network_api](https://github.
 - [Limitations](#limitations)
 - [Troubleshooting](#troubleshooting)
 - [Security](#security)
+- [Add-on: Wi-Fi clients by filter](#add-on-wi-fi-clients-by-filter)
 - [Credits](#credits)
 - [License](#license)
 
@@ -375,6 +376,16 @@ To reduce the load, increase `{$ITEM_STAT.JSON_UPDATE}` (radio details, 2m by de
 - **Do not type the API key on the command line, in logs, chats or tickets.** Use `read -s KEY` and `$KEY`. If the key leaks, delete it in UniFi, create a new one and update Vault.
 - **Use a separate API key for Zabbix.**
 - **Raw API responses are not stored** (history 0). The internal device API also returns device keys (`x_authkey` and others). The template drops them in preprocessing before anything is stored.
+
+## Add-on: Wi-Fi clients by filter
+
+A separate template in `template/zbx_unifi_wifi_clients_7.0.yaml`. It creates a Zabbix host for each UniFi client that matches your filter: Wi-Fi network name (SSID), client name or hostname, MAC vendor, site — in any combination. Each client host gets signal, rates, retries, CCQ, Experience, roaming history, ICMP ping and UniFi anomalies.
+
+- **For stationary devices** with fixed MAC addresses: scanners, terminals, IoT controllers, PTP bridges. Random (private) MAC addresses are skipped by default.
+- **One filter host per device category**, with its own macros. A safety limit (200 clients) protects against a too broad filter.
+- **Independent of the main template:** it needs only the same two global macros.
+
+Full description: [docs/WIFI_CLIENTS.md](docs/WIFI_CLIENTS.md).
 
 ## Credits
 

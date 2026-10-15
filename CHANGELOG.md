@@ -3,6 +3,19 @@
 All notable changes to this project are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/), versioning: [SemVer](https://semver.org/).
 
+## [1.1.0] - 2026-10-15
+
+### Added
+- Add-on template `template/zbx_unifi_wifi_clients_7.0.yaml` (independent of the main template):
+  - **UniFi Network API - Wi-Fi Clients Filter**: creates a host for each UniFi client of all sites that matches the filter
+    macros `{$FILTER.SSID}`, `{$FILTER.NAME}`, `{$FILTER.OUI}`, `{$FILTER.SITE}`, `{$FILTER.EXCLUDE}` (all non-empty filters must match);
+    random (private) MAC addresses skipped by default; safety limit `{$FILTER.MAX_CLIENTS}` (200); wired clients optional;
+    category and technical host name prefix per filter host; fail-safe discovery; disable after 30 days, delete after 31 days.
+  - **UniFi Network API - Wi-Fi Client**: signal, noise, SNR, Tx/Rx rate, Tx retries, CCQ, MCS, dropped frames, Experience,
+    band / channel / width / standard / MIMO, roaming history (30 days), traffic, ICMP ping, UniFi anomalies.
+    Rate alerts off by default; ping alert can be switched off with `{$TRIGGER_CLIENT_PING}`.
+- Documentation of the add-on in English and Russian: `docs/WIFI_CLIENTS.md`, `docs/WIFI_CLIENTS.ru.md`.
+
 ## [1.0.0] - 2026-10-09
 
 First release. Zabbix 7.0 port of
@@ -36,6 +49,20 @@ First release. Zabbix 7.0 port of
 ---
 
 # Журнал изменений
+
+## [1.1.0] - 2026-10-15
+
+### Добавлено
+- Дополнительный шаблон `template/zbx_unifi_wifi_clients_7.0.yaml` (не зависит от основного):
+  - **UniFi Network API - Wi-Fi Clients Filter**: создаёт хост для каждого клиента UniFi всех сайтов, подходящего под макросы
+    фильтра `{$FILTER.SSID}`, `{$FILTER.NAME}`, `{$FILTER.OUI}`, `{$FILTER.SITE}`, `{$FILTER.EXCLUDE}` (должны совпасть все заполненные);
+    случайные (приватные) MAC по умолчанию пропускаются; предохранитель `{$FILTER.MAX_CLIENTS}` (200); проводные клиенты по желанию;
+    категория и префикс технического имени хоста задаются на каждом хосте-фильтре; безопасное обнаружение; отключение через 30 дней,
+    удаление через 31 день.
+  - **UniFi Network API - Wi-Fi Client**: сигнал, шум, SNR, Tx/Rx Rate, Tx Retries, CCQ, MCS, потерянные кадры, Experience,
+    диапазон / канал / ширина / стандарт / MIMO, журнал роуминга (30 дней), трафик, ICMP ping, аномалии UniFi.
+    Тревоги по скорости по умолчанию выключены; тревогу ping можно выключить макросом `{$TRIGGER_CLIENT_PING}`.
+- Документация дополнения на английском и русском: `docs/WIFI_CLIENTS.md`, `docs/WIFI_CLIENTS.ru.md`.
 
 ## [1.0.0] - 2026-10-09
 

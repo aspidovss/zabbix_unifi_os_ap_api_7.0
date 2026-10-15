@@ -1,0 +1,1478 @@
+zabbix_export:
+  version: '7.0'
+  template_groups:
+    - uuid: 36bff6c29af64692839d077febfc7079
+      name: Templates/Network devices
+  host_groups:
+    - uuid: 54efefe21914464fa6f4cee4352d8b35
+      name: UniFi Network/Wi-Fi Clients
+  templates:
+    - uuid: 1cb480903720473f85ddc0535be5851d
+      template: UniFi Network API - Wi-Fi Clients Filter
+      name: UniFi Network API - Wi-Fi Clients Filter
+      description: |-
+        Creates a Zabbix host for every UniFi client that matches the filter macros of this host ({$FILTER.SSID}, {$FILTER.NAME}, {$FILTER.OUI}; all non-empty filters must match). Link it to a host without interfaces, set the filter macros on that host. One host = one filter; create several hosts for several device categories.
+
+        REQUIRED GLOBAL MACROS: {$UNIFI_NETWORK_API_ADDRESS}, {$UNIFI_NETWORK_API_KEY} (same as for the main template).
+        Intended for stationary devices with fixed MAC addresses (scanners, terminals, IoT, controllers, bridges). Random (private) MAC addresses are skipped by default.
+
+        Author AspidovSS, MIT License.
+      groups:
+        - name: Templates/Network devices
+      items:
+        - uuid: cf846809bd13484fa58ebf9bd63639e0
+          name: Filtered Clients JSON (all sites)
+          type: SCRIPT
+          key: filter.clients.json
+          delay: '{$ITEM_FILTER.UPDATE}'
+          history: '0'
+          value_type: TEXT
+          params: |
+            // Clients of all UniFi sites that match the filter of this host.
+            // All non-empty filters must match (AND). Regexes are case-insensitive.
+            // NOTE: Zabbix expands user macros inside this script text, so macro names are never written here literally.
+            var p = JSON.parse(value);
+
+            function opt(v) {
+                // empty or unresolved macro = filter not set
+                v = String(v === undefined || v === null ? '' : v);
+                return (v === '' || v.charAt(0) === '{') ? '' : v;
+            }
+            function rx(v, what) {
+                v = opt(v);
+                if (!v) return null;
+                try {
+                    return new RegExp(v, 'i');
+                } catch (e) {
+                    throw 'Invalid regular expression in the ' + what + ' filter: ' + v;
+                }
+            }
+
+            var fSsid = rx(p.ssid, 'SSID'), fName = rx(p.name, 'name'), fOui = rx(p.oui, 'OUI'),
+                fSite = rx(p.site, 'site'), fExcl = rx(p.exclude, 'exclude');
+            var wired = opt(p.wired) === '1', randomMac = opt(p.random_mac) === '1';
+            var max = parseInt(opt(p.max), 10);
+            if (!(max > 0)) max = 200;
+            var prefix = opt(p.prefix) || 'client';
+            if (!/^[A-Za-z0-9._-]+$/.test(prefix)) {
+                throw 'The prefix filter macro may contain only Latin letters, digits, ".", "_" and "-": ' + prefix;
+            }
+            var category = opt(p.category) || 'Wi-Fi Client';
+
+            if (!fSsid && !fName && !fOui) {
+                throw 'No filter set: fill at least one of the SSID, name or OUI filter macros on this host';
+            }
+
+            var base = 'https://' + p.address + '/proxy/network';
+            var req = new HttpRequest();
+            req.addHeader('Accept: application/json');
+            req.addHeader('X-API-KEY: ' + p.api_key);
+
+            function get(url) {
+                var resp = req.get(url);
+                if (req.getStatus() != 200) {
+                    throw 'HTTP ' + req.getStatus() + ': ' + String(resp).substring(0, 200);
+                }
+                return JSON.parse(resp);
+            }
+
+            var sites = [], offset = 0, total = 0, pages = 0, j;
+            do {
+                j = get(base + '/integration/v1/sites?limit=200&offset=' + offset);
+                total = j.totalCount;
+                sites = sites.concat(j.data);
+                offset += j.data.length;
+                pages++;
+            } while (j.data.length > 0 && offset < total && pages < 50);
+
+            // locally administered (random / private) MAC: second bit of the first octet is set
+            function isRandomMac(mac) {
+                return (parseInt(mac.substring(0, 2), 16) & 2) === 2;
+            }
+
+            var out = [], failed = [], skippedRandom = 0;
+            for (var s = 0; s < sites.length; s++) {
+                var site = sites[s];
+                if (fSite && !fSite.test(String(site.name || ''))) continue;
+                var data;
+                try {
+                    data = get(base + '/api/s/' + site.internalReference + '/stat/sta').data || [];
+                } catch (e) {
+                    failed.push(site.name);
+                    Zabbix.log(3, '[UniFi client filter] site "' + site.name + '": ' + e);
+                    continue;
+                }
+                for (var i = 0; i < data.length; i++) {
+                    var c = data[i];
+                    var mac = String(c.mac || '').toLowerCase();
+                    if (!mac) continue;
+                    var name = String(c.name || ''), host = String(c.hostname || '');
+                    if (c.is_wired && !wired) continue;
+                    if (fSsid && (c.is_wired || !fSsid.test(String(c.essid || '')))) continue;
+                    if (fName && !fName.test(name) && !fName.test(host)) continue;
+                    if (fOui && !fOui.test(String(c.oui || ''))) continue;
+                    if (fExcl && (fExcl.test(name) || fExcl.test(host) || fExcl.test(mac))) continue;
+                    if (!randomMac && isRandomMac(mac)) {
+                        skippedRandom++;
+                        continue;
+                    }
+                    out.push({
+                        mac: mac,
+                        hostid: prefix + '-' + mac.replace(/:/g, ''),
+                        name: c.name || c.hostname || mac,
+                        ip: c.ip || c.last_ip || '0.0.0.0',
+                        essid: c.essid || '',
+                        site_ref: site.internalReference,
+                        site_name: site.name,
+                        category: category
+                    });
+                }
+            }
+
+            if (failed.length > 0) {
+                // never return a partial list: discovery would treat clients of failed sites as lost
+                throw 'UniFi API: stat/sta failed for ' + failed.length + ' of ' + sites.length + ' sites: ' + failed.join(', ');
+            }
+            if (out.length > max) {
+                // protection against a too broad filter (e.g. a guest network with hundreds of phones)
+                throw 'Filter matches ' + out.length + ' clients, the limit is ' + max +
+                      '. Narrow the filter or raise the limit macro on this host.';
+            }
+            out.sort(function (x, y) { return x.mac < y.mac ? -1 : (x.mac > y.mac ? 1 : 0); });
+            // visible host names must be unique: add the MAC to names that repeat within a site
+            var seen = {};
+            for (var k = 0; k < out.length; k++) {
+                var key = out[k].site_name + '|' + String(out[k].name).toLowerCase();
+                seen[key] = (seen[key] || 0) + 1;
+            }
+            for (var k = 0; k < out.length; k++) {
+                if (seen[out[k].site_name + '|' + String(out[k].name).toLowerCase()] > 1 && out[k].name !== out[k].mac) {
+                    out[k].name = out[k].name + ' (' + out[k].mac + ')';
+                }
+            }
+            return JSON.stringify({clients: out, skipped_random_mac: skippedRandom, sites: sites.length});
+          timeout: 60s
+          parameters:
+            - name: address
+              value: '{$UNIFI_NETWORK_API_ADDRESS}'
+            - name: api_key
+              value: '{$UNIFI_NETWORK_API_KEY}'
+            - name: ssid
+              value: '{$FILTER.SSID}'
+            - name: name
+              value: '{$FILTER.NAME}'
+            - name: oui
+              value: '{$FILTER.OUI}'
+            - name: site
+              value: '{$FILTER.SITE}'
+            - name: exclude
+              value: '{$FILTER.EXCLUDE}'
+            - name: wired
+              value: '{$FILTER.WIRED}'
+            - name: random_mac
+              value: '{$FILTER.RANDOM_MAC}'
+            - name: max
+              value: '{$FILTER.MAX_CLIENTS}'
+            - name: prefix
+              value: '{$FILTER.PREFIX}'
+            - name: category
+              value: '{$FILTER.CATEGORY}'
+          description: Connected clients of all sites (internal API stat/sta) that match the filter of this host. Fails (and discovery skips the run) if any site does not answer, if no filter is set, or if more than {$FILTER.MAX_CLIENTS} clients match.
+          tags:
+            - tag: UniFi Component
+              value: Raw
+        - uuid: 1620eb565e8142c0b9a0e0517d44713e
+          name: Filtered Clients Connected
+          type: DEPENDENT
+          key: filter.clients.count
+          delay: '0'
+          history: '{$ITEM_FILTER.HISTORY}'
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - return JSON.parse(value).clients.length;
+          master_item:
+            key: filter.clients.json
+          description: Connected clients that match the filter (all sites).
+          tags:
+            - tag: UniFi Component
+              value: Clients
+          triggers:
+            - uuid: b032dcc3a47b4966b94dc5127ee423e3
+              expression: nodata(/UniFi Network API - Wi-Fi Clients Filter/filter.clients.count,{$TRIGGER_FILTER_NODATA})=1
+              name: 'Client filter: no data for {$TRIGGER_FILTER_NODATA}'
+              priority: WARNING
+              description: 'The filter script fails: check the item "Filtered Clients JSON (all sites)" (Info column / Test). Typical causes: API not reachable, no filter set, invalid regex, limit {$FILTER.MAX_CLIENTS} exceeded.'
+        - uuid: f37cf5289fa34dc782df64a0b2097d80
+          name: Random MAC Clients Skipped
+          type: DEPENDENT
+          key: filter.clients.random_skipped
+          delay: '0'
+          history: '{$ITEM_FILTER.HISTORY}'
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - return JSON.parse(value).skipped_random_mac;
+          master_item:
+            key: filter.clients.json
+          description: Clients that match the filter but use a random (private) MAC address and were skipped. Set {$FILTER.RANDOM_MAC} to 1 to include them.
+          tags:
+            - tag: UniFi Component
+              value: Clients
+      discovery_rules:
+        - uuid: 4b0863eee48a4f868f85a6c62ea49f78
+          name: Discovery Filtered Clients
+          type: DEPENDENT
+          key: discovery.filter.clients
+          delay: '0'
+          description: A client that is not connected (or no longer matches the filter) disappears from the list. Its host keeps working (offline alert after 48h), is disabled after 30 days and deleted after 31 days.
+          host_prototypes:
+            - uuid: 689deb4cb83d4956b3bcc870a33ceaac
+              host: '{#HOSTID}'
+              name: UniFi [{#SITE.NAME}] - {#CATEGORY}:{#NAME}
+              group_links:
+                - group:
+                    name: UniFi Network/Wi-Fi Clients
+              group_prototypes:
+                - name: UniFi Network/Wi-Fi Clients/{#CATEGORY}
+              templates:
+                - name: UniFi Network API - Wi-Fi Client
+              macros:
+                - macro: '{$CLIENT.MAC}'
+                  value: '{#MAC}'
+                  description: Client MAC. Used by Template, DO NOT CHANGE OR DELETE.
+                - macro: '{$SITE.REF}'
+                  value: '{#SITE.REF}'
+                  description: Site short name. Used by Template, DO NOT CHANGE OR DELETE.
+              tags:
+                - tag: UniFi
+                  value: '{#CATEGORY}'
+                - tag: UniFi Site
+                  value: '{#SITE.NAME}'
+              custom_interfaces: 'YES'
+              interfaces:
+                - ip: '{#IP}'
+          master_item:
+            key: filter.clients.json
+          lld_macro_paths:
+            - lld_macro: '{#MAC}'
+              path: $.mac
+            - lld_macro: '{#HOSTID}'
+              path: $.hostid
+            - lld_macro: '{#NAME}'
+              path: $.name
+            - lld_macro: '{#IP}'
+              path: $.ip
+            - lld_macro: '{#SITE.REF}'
+              path: $.site_ref
+            - lld_macro: '{#SITE.NAME}'
+              path: $.site_name
+            - lld_macro: '{#CATEGORY}'
+              path: $.category
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var a = JSON.parse(value).clients, out = [];
+                  // only stable fields: discovery runs when a client appears, disappears, is renamed or gets a new IP
+                  for (var i = 0; i < a.length; i++) {
+                      out.push({ mac: a[i].mac, hostid: a[i].hostid, name: a[i].name, ip: a[i].ip,
+                                 site_ref: a[i].site_ref, site_name: a[i].site_name, category: a[i].category });
+                  }
+                  return JSON.stringify(out);
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - '{$LLD_FILTER.HEARTBEAT}'
+          lifetime_type: DELETE_AFTER
+          lifetime: 31d
+          enabled_lifetime_type: DISABLE_AFTER
+          enabled_lifetime: 30d
+      macros:
+        - macro: '{$FILTER.CATEGORY}'
+          value: Wi-Fi Client
+          description: 'Category: host name "UniFi [<site>] - <category>:<name>", group "UniFi Network/Wi-Fi Clients/<category>", host tag UniFi. Unique per filter host'
+        - macro: '{$FILTER.EXCLUDE}'
+          description: 'Regex: skip clients whose name, hostname or MAC matches. Empty = no exclusions'
+        - macro: '{$FILTER.MAX_CLIENTS}'
+          value: '200'
+          description: 'Safety limit (positive number): if more clients match, discovery is not run and the item shows an error'
+        - macro: '{$FILTER.NAME}'
+          description: 'Regex: client name in UniFi or hostname. Empty = not used. Example: ^wirenboard'
+        - macro: '{$FILTER.OUI}'
+          description: 'Regex: MAC vendor as shown by UniFi. Empty = not used. Example: ubiquiti'
+        - macro: '{$FILTER.PREFIX}'
+          value: client
+          description: 'Technical host name prefix "<prefix>-<mac>": Latin letters, digits, ".", "_", "-". Unique per filter host'
+        - macro: '{$FILTER.RANDOM_MAC}'
+          value: '0'
+          description: 1 = also clients with random (private) MAC addresses; 0 = skip them (recommended)
+        - macro: '{$FILTER.SITE}'
+          description: 'Regex: site name. Empty = all sites'
+        - macro: '{$FILTER.SSID}'
+          description: 'Regex: Wi-Fi network name (SSID). Empty = not used. Example: ^scanners$'
+        - macro: '{$FILTER.WIRED}'
+          value: '0'
+          description: 1 = also wired clients (only without {$FILTER.SSID}); 0 = wireless only
+        - macro: '{$ITEM_FILTER.HISTORY}'
+          value: 30d
+          description: History of the counters on this host
+        - macro: '{$ITEM_FILTER.UPDATE}'
+          value: 30m
+          description: How often the clients of all sites are checked against the filter
+        - macro: '{$LLD_FILTER.HEARTBEAT}'
+          value: 1d
+          description: Discovery runs when the list changes or at least this often
+        - macro: '{$TRIGGER_FILTER_NODATA}'
+          value: 2h
+          description: Alert if the filter script returns no data for this period
+    - uuid: d9f5835b8d6d4286aaaa44dbade84247
+      template: UniFi Network API - Wi-Fi Client
+      name: UniFi Network API - Wi-Fi Client
+      description: Wi-Fi (or wired) client of UniFi, created by a host with the template "UniFi Network API - Wi-Fi Clients Filter". Signal, rates, retries, CCQ, Experience, roaming history, ICMP ping and UniFi anomalies. Radio items stay empty for wired clients. Author AspidovSS, MIT License.
+      groups:
+        - name: Templates/Network devices
+      items:
+        - uuid: 2b0047e8ec1d4ecda789bb7d116c9d27
+          name: Client Stat JSON
+          type: HTTP_AGENT
+          key: client.json
+          delay: '{$ITEM_CLIENT.JSON_UPDATE}'
+          history: '0'
+          value_type: TEXT
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var j = JSON.parse(value);
+                  var mac = '{$CLIENT.MAC}'.toLowerCase();
+                  var data = j.data || [], c = null;
+                  for (var i = 0; i < data.length; i++) {
+                      if (String(data[i].mac).toLowerCase() === mac) {
+                          c = data[i];
+                          break;
+                      }
+                  }
+                  if (!c) {
+                      return JSON.stringify({connected: 0});
+                  }
+                  var bands = {ng: '2.4GHz', na: '5GHz', '6e': '6GHz'};
+                  var std = {b: 'Legacy', g: 'Legacy', a: 'Legacy', ng: 'WiFi 4', na: 'WiFi 4', ac: 'WiFi 5', ax: 'WiFi 6', be: 'WiFi 7'};
+                  var num = function (v) { return (v === undefined || v === null) ? 0 : Number(v); };
+                  // optional value: undefined (key dropped from the JSON) when UniFi does not report it
+                  var opt = function (v) { return (v === undefined || v === null || v === '') ? undefined : Number(v); };
+                  var out = {
+                      connected: 1,
+                      ip: c.ip || c.last_ip || 'n/a',
+                      ap_name: c.last_uplink_name || c.ap_mac || 'n/a',
+                      ap_mac: c.ap_mac || 'n/a',
+                      essid: c.essid || 'n/a',
+                      network: (c.network || 'n/a') + (c.vlan ? ' (VLAN ' + c.vlan + ')' : ''),
+                      band: bands[c.radio] || c.radio || 'n/a',
+                      channel: num(c.channel),
+                      channel_width: num(c.channelWidth),
+                      standard: std[c.radio_proto] || c.radio_proto || 'n/a',
+                      mimo: c.nss ? (c.nss + 'x' + c.nss) : 'n/a',
+                      signal: opt(c.signal),
+                      noise: opt(c.noise),
+                      snr: (c.signal !== undefined && c.noise !== undefined) ? num(c.signal) - num(c.noise) : undefined,
+                      tx_rate: num(c.tx_rate) * 1000,
+                      rx_rate: num(c.rx_rate) * 1000,
+                      tx_retries_pct: opt(c.wifi_tx_retries_percentage),
+                      satisfaction: opt(c.satisfaction),
+                      uptime: num(c.uptime),
+                      roam_count: num(c.roam_count),
+                      down_bps: num(c['tx_bytes-r']) * 8,
+                      up_bps: num(c['rx_bytes-r']) * 8,
+                      tx_packets: num(c.tx_packets),
+                      ccq: opt(c.ccq) === undefined ? undefined : num(c.ccq) / 10,
+                      mcs: opt(c.tx_mcs),
+                      anomalies: num(c.anomalies),
+                      tx_attempts: num(c.wifi_tx_attempts),
+                      tx_dropped: num(c.wifi_tx_dropped),
+                      tx_bytes: num(c.tx_bytes),
+                      rx_bytes: num(c.rx_bytes),
+                      first_seen: num(c.first_seen),
+                      assoc_time: num(c.latest_assoc_time || c.assoc_time),
+                      hostname: c.hostname || 'n/a',
+                      oui: c.oui || 'n/a',
+                      conn_type: c.is_wired ? 'Wired' : 'Wireless'
+                  };
+                  if (c.is_wired) {
+                      // no radio data for wired clients: leave these items empty instead of reporting zeros
+                      var wl = ['ap_mac', 'essid', 'band', 'channel', 'channel_width', 'standard', 'mimo', 'signal', 'noise', 'snr',
+                                'tx_rate', 'rx_rate', 'tx_retries_pct', 'ccq', 'mcs', 'tx_attempts', 'tx_dropped', 'roam_count', 'satisfaction'];
+                      for (var k = 0; k < wl.length; k++) delete out[wl[k]];
+                  }
+                  return JSON.stringify(out);
+          url: https://{$UNIFI_NETWORK_API_ADDRESS}/proxy/network/api/s/{$SITE.REF}/stat/sta
+          headers:
+            - name: Accept
+              value: application/json
+            - name: X-API-KEY
+              value: '{$UNIFI_NETWORK_API_KEY}'
+          description: Active clients of the site; preprocessing keeps only this client ({$CLIENT.MAC}). connected=0 if not connected.
+          tags:
+            - tag: UniFi Component
+              value: Raw
+          timeout: '{$ITEM_CLIENT.TIMEOUT}'
+        - uuid: 56e81fa9eb404032b744ba3295990541
+          name: Connected
+          type: DEPENDENT
+          key: client.connected
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          description: 1 = connected to an AP, 0 = not connected
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.connected
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Connection
+          triggers:
+            - uuid: d0a8eeb6f7ff4f14ac520fd20f844f02
+              expression: max(/UniFi Network API - Wi-Fi Client/client.connected,{$TRIGGER_CLIENT_OFFLINE_TIME})=0
+              name: Client not connected for more than {$TRIGGER_CLIENT_OFFLINE_TIME}
+              priority: INFO
+          trends: 30d
+        - uuid: ce3d6749c4e945fb97ab584e7e0ef040
+          name: Access Point
+          type: DEPENDENT
+          key: client.ap.name
+          delay: '0'
+          history: '{$ITEM_CLIENT.ROAM_HISTORY}'
+          value_type: CHAR
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.ap_name
+              error_handler: DISCARD_VALUE
+            - type: DISCARD_UNCHANGED
+              parameters:
+                - ''
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Connection
+          triggers:
+            - uuid: 9ecfe526b23b4394a0fe41c1f88c5976
+              expression: change(/UniFi Network API - Wi-Fi Client/client.ap.name)<>0 and nodata(/UniFi Network API - Wi-Fi Client/client.ap.name,{$TRIGGER_CLIENT_ROAM_SHOW})=0
+              name: Client roamed to AP "{ITEM.LASTVALUE}"
+              event_name: 'Client roamed: {?last(/{HOST.HOST}/client.ap.name,#2)} -> {ITEM.LASTVALUE}'
+              priority: INFO
+              manual_close: 'YES'
+              description: 'Informational. Closes automatically {$TRIGGER_CLIENT_ROAM_SHOW} after the roam. History of roams: item "Access Point" (latest data -> history).'
+          description: 'Stored only when the AP changes: the item history is the roaming history.'
+        - uuid: 672759092de346ed926475ab8cc2b55f
+          name: Access Point MAC
+          type: DEPENDENT
+          key: client.ap.mac
+          delay: '0'
+          history: '{$ITEM_CLIENT.INFO_HISTORY}'
+          value_type: CHAR
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.ap_mac
+              error_handler: DISCARD_VALUE
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1d
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Connection
+        - uuid: bf27cba3aaef4c709c2aa48462a3f886
+          name: SSID
+          type: DEPENDENT
+          key: client.essid
+          delay: '0'
+          history: '{$ITEM_CLIENT.INFO_HISTORY}'
+          value_type: CHAR
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.essid
+              error_handler: DISCARD_VALUE
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1d
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Connection
+        - uuid: e200f6e1da4940238524ba38484d61f0
+          name: Network
+          type: DEPENDENT
+          key: client.network
+          delay: '0'
+          history: '{$ITEM_CLIENT.INFO_HISTORY}'
+          value_type: CHAR
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.network
+              error_handler: DISCARD_VALUE
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1d
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Connection
+        - uuid: 878b563990bb4b2fabf8ddd4f4a9020a
+          name: IP Address
+          type: DEPENDENT
+          key: client.ip
+          delay: '0'
+          history: '{$ITEM_CLIENT.INFO_HISTORY}'
+          value_type: CHAR
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.ip
+              error_handler: DISCARD_VALUE
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1h
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Connection
+        - uuid: 4b9c07ab511843ccbcd0188ee89fd34a
+          name: Band
+          type: DEPENDENT
+          key: client.band
+          delay: '0'
+          history: '{$ITEM_CLIENT.INFO_HISTORY}'
+          value_type: CHAR
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.band
+              error_handler: DISCARD_VALUE
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1d
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Radio
+        - uuid: 56631e1ed5444081a46ca75afa642a2d
+          name: Channel
+          type: DEPENDENT
+          key: client.channel
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.channel
+              error_handler: DISCARD_VALUE
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1h
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Radio
+          trends: 30d
+        - uuid: b7faa951e9b74df4a6738147a7e0bc9d
+          name: Channel Width
+          type: DEPENDENT
+          key: client.channel.width
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          units: MHz
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.channel_width
+              error_handler: DISCARD_VALUE
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1h
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Radio
+          trends: 30d
+        - uuid: a03007b10a894e6f88fc08e73439ae9e
+          name: WiFi Standard
+          type: DEPENDENT
+          key: client.standard
+          delay: '0'
+          history: '{$ITEM_CLIENT.INFO_HISTORY}'
+          value_type: CHAR
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.standard
+              error_handler: DISCARD_VALUE
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1d
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Radio
+        - uuid: 7d356aceb66a4112964660797b90c623
+          name: MIMO
+          type: DEPENDENT
+          key: client.mimo
+          delay: '0'
+          history: '{$ITEM_CLIENT.INFO_HISTORY}'
+          value_type: CHAR
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.mimo
+              error_handler: DISCARD_VALUE
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1h
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Radio
+        - uuid: d635c20bd5004faaa7f92a025366ba95
+          name: Signal
+          type: DEPENDENT
+          key: client.signal
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          value_type: FLOAT
+          units: dBm
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.signal
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Signal
+          triggers:
+            - uuid: 0aea0d538bd7406796ac6aabbf3bd630
+              expression: max(/UniFi Network API - Wi-Fi Client/client.signal,{$TRIGGER_CLIENT_SIGNAL_TIME})<{$TRIGGER_CLIENT_SIGNAL_CRIT}
+              name: Very weak signal {ITEM.LASTVALUE} (< {$TRIGGER_CLIENT_SIGNAL_CRIT} dBm for {$TRIGGER_CLIENT_SIGNAL_TIME})
+              priority: AVERAGE
+            - uuid: 6d2184f0a5144509b46805a31a1ade68
+              expression: max(/UniFi Network API - Wi-Fi Client/client.signal,{$TRIGGER_CLIENT_SIGNAL_TIME})<{$TRIGGER_CLIENT_SIGNAL_MIN}
+              name: Weak signal {ITEM.LASTVALUE} (< {$TRIGGER_CLIENT_SIGNAL_MIN} dBm for {$TRIGGER_CLIENT_SIGNAL_TIME})
+              priority: WARNING
+              dependencies:
+                - name: Very weak signal {ITEM.LASTVALUE} (< {$TRIGGER_CLIENT_SIGNAL_CRIT} dBm for {$TRIGGER_CLIENT_SIGNAL_TIME})
+                  expression: max(/UniFi Network API - Wi-Fi Client/client.signal,{$TRIGGER_CLIENT_SIGNAL_TIME})<{$TRIGGER_CLIENT_SIGNAL_CRIT}
+          trends: 30d
+        - uuid: 4eb91d571d9e47e1a27e14fd060dcc6a
+          name: Noise
+          type: DEPENDENT
+          key: client.noise
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          value_type: FLOAT
+          units: dBm
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.noise
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Signal
+          trends: 30d
+        - uuid: 577f8cfff5494efaa41be7fabad5f479
+          name: SNR
+          type: DEPENDENT
+          key: client.snr
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          units: dB
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.snr
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Signal
+          trends: 30d
+        - uuid: ccb3b79cedf048be96dbee155bd8dc93
+          name: Tx Rate (AP to client)
+          type: DEPENDENT
+          key: client.tx.rate
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          units: bps
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.tx_rate
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Signal
+          triggers:
+            - uuid: c064b8a91c6540adab8e6605eeed0ea6
+              expression: '{$TRIGGER_CLIENT_RATE_HIGH}>0 and min(/UniFi Network API - Wi-Fi Client/client.tx.rate,{$TRIGGER_CLIENT_RATE_TIME})>{$TRIGGER_CLIENT_RATE_HIGH}*1000000'
+              name: Tx Rate above {$TRIGGER_CLIENT_RATE_HIGH} Mbps for {$TRIGGER_CLIENT_RATE_TIME}
+              priority: INFO
+              description: Off while {$TRIGGER_CLIENT_RATE_HIGH} is 0.
+            - uuid: efe7fe30153d4bfa811ccc6a18fe5907
+              expression: '{$TRIGGER_CLIENT_RATE_LOW}>0 and max(/UniFi Network API - Wi-Fi Client/client.tx.rate,{$TRIGGER_CLIENT_RATE_TIME})<{$TRIGGER_CLIENT_RATE_LOW}*1000000'
+              name: Tx Rate below {$TRIGGER_CLIENT_RATE_LOW} Mbps for {$TRIGGER_CLIENT_RATE_TIME}
+              priority: WARNING
+              description: 'Off while {$TRIGGER_CLIENT_RATE_LOW} is 0. Idle devices often send at the minimum rate (1 Mbps): enable only for devices with constant traffic.'
+          trends: 30d
+        - uuid: 71b0c2aa4f6f4006960cfc93d99e6cdc
+          name: Rx Rate (client to AP)
+          type: DEPENDENT
+          key: client.rx.rate
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          units: bps
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.rx_rate
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Signal
+          triggers:
+            - uuid: d68288adf6784d9ca444d7b0442f7b1b
+              expression: '{$TRIGGER_CLIENT_RATE_HIGH}>0 and min(/UniFi Network API - Wi-Fi Client/client.rx.rate,{$TRIGGER_CLIENT_RATE_TIME})>{$TRIGGER_CLIENT_RATE_HIGH}*1000000'
+              name: Rx Rate above {$TRIGGER_CLIENT_RATE_HIGH} Mbps for {$TRIGGER_CLIENT_RATE_TIME}
+              priority: INFO
+              description: Off while {$TRIGGER_CLIENT_RATE_HIGH} is 0.
+            - uuid: 8edf6d6ca71747979c43427d47a6b20c
+              expression: '{$TRIGGER_CLIENT_RATE_LOW}>0 and max(/UniFi Network API - Wi-Fi Client/client.rx.rate,{$TRIGGER_CLIENT_RATE_TIME})<{$TRIGGER_CLIENT_RATE_LOW}*1000000'
+              name: Rx Rate below {$TRIGGER_CLIENT_RATE_LOW} Mbps for {$TRIGGER_CLIENT_RATE_TIME}
+              priority: WARNING
+              description: 'Off while {$TRIGGER_CLIENT_RATE_LOW} is 0. Idle devices often send at the minimum rate (1 Mbps): enable only for devices with constant traffic.'
+          trends: 30d
+        - uuid: d5abab50751e4c2ab5b925cd7bdb82ac
+          name: Tx Retries
+          type: DEPENDENT
+          key: client.tx.retry.pct
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          value_type: FLOAT
+          units: '%'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.tx_retries_pct
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Signal
+          triggers:
+            - uuid: ccdf4915b1d24d98adca822d6074bca7
+              expression: min(/UniFi Network API - Wi-Fi Client/client.tx.retry.pct,{$TRIGGER_CLIENT_TXRETRIES_TIME})>{$TRIGGER_CLIENT_TXRETRIES} and avg(/UniFi Network API - Wi-Fi Client/client.tx.packets,{$TRIGGER_CLIENT_TXRETRIES_TIME})>{$TRIGGER_CLIENT_TXRETRIES_MIN_PPS}
+              name: Tx Retries > {$TRIGGER_CLIENT_TXRETRIES}% for {$TRIGGER_CLIENT_TXRETRIES_TIME}
+              priority: WARNING
+              description: Fires only while the client receives traffic (low-traffic periods are ignored).
+          trends: 30d
+        - uuid: 29d844c2a61e4053b478f3e16c8ee769
+          name: Experience
+          type: DEPENDENT
+          key: client.satisfaction
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          units: '%'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.satisfaction
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Signal
+          triggers:
+            - uuid: 498d9c0267dd4912acc768ec7a90068b
+              expression: avg(/UniFi Network API - Wi-Fi Client/client.satisfaction,{$TRIGGER_CLIENT_EXPERIENCE_TIME})<{$TRIGGER_CLIENT_EXPERIENCE_MIN}
+              name: 'Low Experience: average below {$TRIGGER_CLIENT_EXPERIENCE_MIN}% for {$TRIGGER_CLIENT_EXPERIENCE_TIME}'
+              priority: WARNING
+          trends: 30d
+        - uuid: 10bad6801919402aa00150624b93ed11
+          name: Download (AP to client)
+          type: DEPENDENT
+          key: client.down
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          value_type: FLOAT
+          units: bps
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.down_bps
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Traffic
+          trends: 30d
+        - uuid: 8634d00e067f42cfabea1128891b1034
+          name: Upload (client to AP)
+          type: DEPENDENT
+          key: client.up
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          value_type: FLOAT
+          units: bps
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.up_bps
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Traffic
+          trends: 30d
+        - uuid: 8bfeefc2de2141939c42670baf2d1762
+          name: Tx Packets (AP to client)
+          type: DEPENDENT
+          key: client.tx.packets
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          value_type: FLOAT
+          units: pps
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.tx_packets
+              error_handler: DISCARD_VALUE
+            - type: CHANGE_PER_SECOND
+              parameters:
+                - ''
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Traffic
+          trends: 30d
+        - uuid: d9809786752b45b68df5e252670e0e38
+          name: Connected Time
+          type: DEPENDENT
+          key: client.uptime
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          units: uptime
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.uptime
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Connection
+          trends: 30d
+        - uuid: 8ab208d923cd470db147c675bb6b05fc
+          name: Roam Count
+          type: DEPENDENT
+          key: client.roam.count
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.roam_count
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Connection
+          trends: 30d
+        - uuid: ef65dac6896a43599b1a3673e8b535df
+          name: CCQ
+          type: DEPENDENT
+          key: client.ccq
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          value_type: FLOAT
+          units: '%'
+          description: 'Client Connection Quality: share of successfully delivered frames'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.ccq
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Signal
+          triggers:
+            - uuid: c1e1850683f14130a897858c14fa4b68
+              expression: max(/UniFi Network API - Wi-Fi Client/client.ccq,{$TRIGGER_CLIENT_CCQ_TIME})<{$TRIGGER_CLIENT_CCQ_MIN} and avg(/UniFi Network API - Wi-Fi Client/client.tx.packets,{$TRIGGER_CLIENT_CCQ_TIME})>{$TRIGGER_CLIENT_TXRETRIES_MIN_PPS}
+              name: Low CCQ {ITEM.LASTVALUE} (< {$TRIGGER_CLIENT_CCQ_MIN}% for {$TRIGGER_CLIENT_CCQ_TIME})
+              priority: WARNING
+              description: Fires only while the client receives traffic.
+          trends: 30d
+        - uuid: b5f2e3697a3d4c23aad387c062c2ec97
+          name: MCS Index
+          type: DEPENDENT
+          key: client.mcs
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          description: Modulation and coding scheme of the last transmission, lower = worse conditions. Empty if UniFi does not report it
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.mcs
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Signal
+          trends: 30d
+          value_type: FLOAT
+        - uuid: 9ce0752d303b42b08d22e2f315698424
+          name: Anomalies (UniFi count)
+          type: DEPENDENT
+          key: client.anomalies.count
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.anomalies
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Anomalies
+          trends: 30d
+        - uuid: 94a4b924656c4a8da5d7a473f8854a37
+          name: Tx Attempts (raw rate)
+          type: DEPENDENT
+          key: client.tx.attempts
+          delay: '0'
+          history: '{$ITEM_CLIENT.RAW_HISTORY}'
+          trends: '0'
+          value_type: FLOAT
+          units: pps
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.tx_attempts
+              error_handler: DISCARD_VALUE
+            - type: CHANGE_PER_SECOND
+              parameters:
+                - ''
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Traffic
+        - uuid: f5754ad48253488cb70401bc9d2abc7f
+          name: Tx Dropped (raw rate)
+          type: DEPENDENT
+          key: client.tx.dropped
+          delay: '0'
+          history: '{$ITEM_CLIENT.RAW_HISTORY}'
+          trends: '0'
+          value_type: FLOAT
+          units: pps
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.tx_dropped
+              error_handler: DISCARD_VALUE
+            - type: CHANGE_PER_SECOND
+              parameters:
+                - ''
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Traffic
+        - uuid: 82a693a4a3c3427fb2b354a77d277c33
+          name: Tx Dropped
+          type: CALCULATED
+          key: client.tx.dropped.pct
+          delay: '{$ITEM_CLIENT.JSON_UPDATE}'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          value_type: FLOAT
+          units: '%'
+          params: 100*last(//client.tx.dropped)/(last(//client.tx.attempts)+0.000001)
+          description: Frames dropped after all retries, % over the last polling interval
+          tags:
+            - tag: UniFi Component
+              value: Signal
+          triggers:
+            - uuid: cd260c7c1bbe41568405af2e6d4428bf
+              expression: min(/UniFi Network API - Wi-Fi Client/client.tx.dropped.pct,{$TRIGGER_CLIENT_TXDROPPED_TIME})>{$TRIGGER_CLIENT_TXDROPPED} and avg(/UniFi Network API - Wi-Fi Client/client.tx.packets,{$TRIGGER_CLIENT_TXDROPPED_TIME})>{$TRIGGER_CLIENT_TXRETRIES_MIN_PPS}
+              name: Dropped frames > {$TRIGGER_CLIENT_TXDROPPED}% for {$TRIGGER_CLIENT_TXDROPPED_TIME}
+              priority: WARNING
+              description: Fires only while the client receives traffic.
+          trends: 30d
+        - uuid: beabd5d5840349328104cd8cb61ff73a
+          name: Total Downloaded (this connection)
+          type: DEPENDENT
+          key: client.bytes.down
+          delay: '0'
+          history: '{$ITEM_CLIENT.BYTES_HISTORY}'
+          trends: 7d
+          units: B
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.tx_bytes
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Traffic
+        - uuid: 7ff99ed26774496c91f9b9111191b0e7
+          name: Total Uploaded (this connection)
+          type: DEPENDENT
+          key: client.bytes.up
+          delay: '0'
+          history: '{$ITEM_CLIENT.BYTES_HISTORY}'
+          trends: 7d
+          units: B
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.rx_bytes
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Traffic
+        - uuid: 1b9ddc12663742308ab6b2feb1cce758
+          name: First Seen
+          type: DEPENDENT
+          key: client.first_seen
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          units: unixtime
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.first_seen
+              error_handler: DISCARD_VALUE
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1d
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Connection
+          trends: 30d
+        - uuid: 399c19dc74be489c9db32c9a2a2af3e4
+          name: Last Association
+          type: DEPENDENT
+          key: client.assoc_time
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          units: unixtime
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.assoc_time
+              error_handler: DISCARD_VALUE
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1h
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Connection
+          trends: 30d
+        - uuid: dd63ca6dc6d64b629da603f44e4cc431
+          name: Anomalies JSON
+          type: HTTP_AGENT
+          key: client.anomalies.json
+          delay: '{$ITEM_CLIENT.ANOMALY_UPDATE}'
+          history: '0'
+          value_type: TEXT
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  function anomalyIgnore(s) {
+                      var m = {}, a = String(s || '').split(/[\s,;]+/);
+                      for (var i = 0; i < a.length; i++) {
+                          if (a[i] && a[i].charAt(0) !== '{') m[a[i].toUpperCase()] = true;
+                      }
+                      return m;
+                  }
+                  function anomalyShort(t) {
+                      return String(t).replace(/^(USER_|AP_)/, '');
+                  }
+                  // entries: [{anomaly, timestamps}] of one device; returns summary
+                  function anomalySummary(entries, now, activeMin, ignore, onlyType) {
+                      var step = 300000, win = activeMin * 60000;
+                      var active = {}, streak = 0, streakType = 'none', hour = {}, n24 = 0;
+                      for (var i = 0; i < entries.length; i++) {
+                          var e = entries[i];
+                          if (ignore[e.anomaly] || ignore[anomalyShort(e.anomaly)]) continue;
+                          if (onlyType && e.anomaly !== onlyType) continue;
+                          var ts = (e.timestamps || []).slice().sort(function (a, b) { return a - b; });
+                          if (!ts.length) continue;
+                          n24 += ts.length;
+                          for (var k = 0; k < ts.length; k++) {
+                              if (now - ts[k] <= 3600000) hour[ts[k]] = true;
+                          }
+                          var last = ts[ts.length - 1];
+                          if (now - last <= win) {
+                              active[anomalyShort(e.anomaly)] = true;
+                              var c = 1;
+                              for (var k = ts.length - 1; k > 0 && ts[k] - ts[k - 1] <= step; k--) c++;
+                              if (c * 5 > streak) {
+                                  streak = c * 5;
+                                  streakType = anomalyShort(e.anomaly);
+                              }
+                          }
+                      }
+                      var names = [];
+                      for (var n in active) names.push(n);
+                      names.sort();
+                      var h = 0;
+                      for (var t in hour) h++;
+                      return {active: names.length ? names.join(', ') : 'none', streak_min: streak, streak_type: streakType,
+                              minutes_1h: h * 5, intervals_24h: n24};
+                  }
+                  var j = JSON.parse(value);
+                  var mac = '{$CLIENT.MAC}'.toLowerCase();
+                  var data = j.data || [], mine = [];
+                  for (var i = 0; i < data.length; i++) {
+                      if (String(data[i].mac).toLowerCase() === mac) mine.push(data[i]);
+                  }
+                  return JSON.stringify(anomalySummary(mine, Date.now(), parseInt('{$ANOMALY_ACTIVE_MIN}', 10) || 15, anomalyIgnore('{$ANOMALY_IGNORE}')));
+          url: https://{$UNIFI_NETWORK_API_ADDRESS}/proxy/network/api/s/{$SITE.REF}/stat/anomalies
+          headers:
+            - name: Accept
+              value: application/json
+            - name: X-API-KEY
+              value: '{$UNIFI_NETWORK_API_KEY}'
+          description: UniFi anomalies of the site for the last 24h; preprocessing keeps only this client.
+          tags:
+            - tag: UniFi Component
+              value: Raw
+          timeout: '{$ITEM_CLIENT.TIMEOUT}'
+        - uuid: 26c569a1c1fc420d8c8b2673376efc10
+          name: 'Anomalies: Active'
+          type: DEPENDENT
+          key: client.anomaly.active
+          delay: '0'
+          history: '{$ITEM_CLIENT.ANOMALY.TEXT_HISTORY}'
+          value_type: CHAR
+          description: Anomaly types seen within {$ANOMALY_ACTIVE_MIN} minutes, none = no anomaly
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.active
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: client.anomalies.json
+          tags:
+            - tag: UniFi Component
+              value: Anomalies
+        - uuid: 1c1948d2706846c7adc53d496786ca1b
+          name: 'Anomalies: Duration'
+          type: DEPENDENT
+          key: client.anomaly.streak
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          units: min
+          description: How long the current anomaly lasts without interruption, minutes
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.streak_min
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: client.anomalies.json
+          tags:
+            - tag: UniFi Component
+              value: Anomalies
+          triggers:
+            - uuid: f8221df185a040fe8d4f3ac73b685e75
+              expression: last(/UniFi Network API - Wi-Fi Client/client.anomaly.streak)>={$TRIGGER_CLIENT_ANOMALY_TIME} and last(/UniFi Network API - Wi-Fi Client/client.anomaly.active)<>"none"
+              name: 'UniFi anomaly for {ITEM.LASTVALUE1}: {ITEM.LASTVALUE2}'
+              priority: WARNING
+          trends: 30d
+        - uuid: f38609f118a4432da965e24002d13482
+          name: 'Anomalies: Minutes (1h)'
+          type: DEPENDENT
+          key: client.anomaly.minutes
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          units: min
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.minutes_1h
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: client.anomalies.json
+          tags:
+            - tag: UniFi Component
+              value: Anomalies
+          trends: 30d
+        - uuid: 5bd70ed831a54fef9883636b029f75c8
+          name: 'Anomalies: Intervals (24h)'
+          type: DEPENDENT
+          key: client.anomaly.intervals
+          delay: '0'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          description: Number of 5-minute anomaly intervals in the last 24 hours (all types)
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.intervals_24h
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: client.anomalies.json
+          tags:
+            - tag: UniFi Component
+              value: Anomalies
+          trends: 30d
+        - uuid: d6b292969dc44503b30fe8d2ef1f1e0f
+          name: ICMP Ping
+          type: SIMPLE
+          key: icmpping
+          delay: '{$ITEM_CLIENT.PING_UPDATE}'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          trends: 30d
+          description: 1 = responds, 0 = no response. Checked against the client IP from UniFi.
+          tags:
+            - tag: UniFi Component
+              value: Ping
+          triggers:
+            - uuid: 8f780014ebb247ecb87114343bcadd4d
+              expression: '{$TRIGGER_CLIENT_PING}=1 and max(/UniFi Network API - Wi-Fi Client/icmpping,{$TRIGGER_CLIENT_PING_TIME})=0 and last(/UniFi Network API - Wi-Fi Client/client.connected)=1'
+              name: Client is connected in UniFi but does not respond to ping for {$TRIGGER_CLIENT_PING_TIME}
+              priority: AVERAGE
+              description: 'Radio link is up (client associated to AP) but the device itself is not reachable: device hung, IP/VLAN problem or routing. Needs a route from the Zabbix server/proxy to the client and fping. Set {$TRIGGER_CLIENT_PING} to 0 if the clients are not reachable from Zabbix.'
+        - uuid: d221d962925b4b77886e5c898a4fd0c7
+          name: ICMP Loss
+          type: SIMPLE
+          key: icmppingloss
+          delay: '{$ITEM_CLIENT.PING_UPDATE}'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          trends: 30d
+          value_type: FLOAT
+          units: '%'
+          tags:
+            - tag: UniFi Component
+              value: Ping
+        - uuid: a95c51e08aa94d60a747749ab05f4d8f
+          name: ICMP Response Time
+          type: SIMPLE
+          key: icmppingsec
+          delay: '{$ITEM_CLIENT.PING_UPDATE}'
+          history: '{$ITEM_CLIENT_HISTORY}'
+          trends: 30d
+          value_type: FLOAT
+          units: s
+          tags:
+            - tag: UniFi Component
+              value: Ping
+        - uuid: 50cb537b95c44537861a8642438f619d
+          name: Hostname
+          type: DEPENDENT
+          key: client.hostname
+          delay: '0'
+          history: '{$ITEM_CLIENT.INFO_HISTORY}'
+          value_type: CHAR
+          description: Hostname reported by the client (DHCP)
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.hostname
+              error_handler: DISCARD_VALUE
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1d
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Connection
+        - uuid: dbc88b11115748289db4a83574775bb4
+          name: Manufacturer (OUI)
+          type: DEPENDENT
+          key: client.oui
+          delay: '0'
+          history: '{$ITEM_CLIENT.INFO_HISTORY}'
+          value_type: CHAR
+          description: Vendor of the MAC address as reported by UniFi
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.oui
+              error_handler: DISCARD_VALUE
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1d
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Connection
+        - uuid: 3db0806447f2495c9cc73ee19b5d70ac
+          name: Connection Type
+          type: DEPENDENT
+          key: client.conn_type
+          delay: '0'
+          history: '{$ITEM_CLIENT.INFO_HISTORY}'
+          value_type: CHAR
+          description: Wired or Wireless
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.conn_type
+              error_handler: DISCARD_VALUE
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1d
+          master_item:
+            key: client.json
+          tags:
+            - tag: UniFi Component
+              value: Connection
+      macros:
+        - macro: '{$ANOMALY_ACTIVE_MIN}'
+          value: '15'
+          description: Anomaly is active if seen within this many minutes
+        - macro: '{$ANOMALY_IGNORE}'
+          value: ''
+          description: Anomaly types to ignore, comma separated (e.g. USER_DNS_TIMEOUT)
+        - macro: '{$CLIENT.MAC}'
+          description: Client MAC. Filled by discovery, DO NOT CHANGE OR DELETE.
+        - macro: '{$ITEM_CLIENT.ANOMALY.TEXT_HISTORY}'
+          value: 7d
+          description: Anomaly text History
+        - macro: '{$ITEM_CLIENT.ANOMALY_UPDATE}'
+          value: 5m
+          description: Item 'client.anomalies.json' Update Interval (UniFi uses 5-minute intervals)
+        - macro: '{$ITEM_CLIENT.BYTES_HISTORY}'
+          value: 7d
+          description: Total traffic History
+        - macro: '{$ITEM_CLIENT.INFO_HISTORY}'
+          value: 30d
+          description: Client text items History
+        - macro: '{$ITEM_CLIENT.JSON_UPDATE}'
+          value: 2m
+          description: Item 'client.json' Update Interval
+        - macro: '{$ITEM_CLIENT.PING_UPDATE}'
+          value: 1m
+          description: ICMP ping interval
+        - macro: '{$ITEM_CLIENT.RAW_HISTORY}'
+          value: 1d
+          description: Raw counter rates History
+        - macro: '{$ITEM_CLIENT.ROAM_HISTORY}'
+          value: 30d
+          description: Roaming history (Access Point changes)
+        - macro: '{$ITEM_CLIENT.TIMEOUT}'
+          value: 15s
+          description: Timeout of the client data and anomalies requests (each reads the list of its site)
+        - macro: '{$ITEM_CLIENT_HISTORY}'
+          value: 30d
+          description: Client numeric items History
+        - macro: '{$SITE.REF}'
+          description: Site short name. Filled by discovery, DO NOT CHANGE OR DELETE.
+        - macro: '{$TRIGGER_CLIENT_ANOMALY_TIME}'
+          value: '30'
+          description: Anomaly alert after this many minutes without interruption
+        - macro: '{$TRIGGER_CLIENT_CCQ_MIN}'
+          value: '50'
+          description: Low CCQ threshold, %
+        - macro: '{$TRIGGER_CLIENT_CCQ_TIME}'
+          value: 30m
+          description: CCQ must stay below threshold this long
+        - macro: '{$TRIGGER_CLIENT_EXPERIENCE_MIN}'
+          value: '70'
+          description: Low Experience threshold, % (average)
+        - macro: '{$TRIGGER_CLIENT_EXPERIENCE_TIME}'
+          value: 7d
+          description: Experience averaging period
+        - macro: '{$TRIGGER_CLIENT_OFFLINE_TIME}'
+          value: 48h
+          description: Offline alert after the client is not connected this long
+        - macro: '{$TRIGGER_CLIENT_PING_TIME}'
+          value: 5m
+          description: 'Connected but no ping: alert after this period'
+        - macro: '{$TRIGGER_CLIENT_PING}'
+          value: '1'
+          description: 1 = alert when the client is connected in UniFi but does not answer ping; 0 = off
+        - macro: '{$TRIGGER_CLIENT_RATE_HIGH}'
+          value: '0'
+          description: 'Rate above this (Mbps) for {$TRIGGER_CLIENT_RATE_TIME}: Info event. 0 = off'
+        - macro: '{$TRIGGER_CLIENT_RATE_LOW}'
+          value: '0'
+          description: 'Rate below this (Mbps) for {$TRIGGER_CLIENT_RATE_TIME}: Warning. 0 = off'
+        - macro: '{$TRIGGER_CLIENT_RATE_TIME}'
+          value: 10m
+          description: Tx/Rx Rate must stay above/below threshold this long
+        - macro: '{$TRIGGER_CLIENT_ROAM_SHOW}'
+          value: 1m
+          description: Roaming event closes automatically after this time
+        - macro: '{$TRIGGER_CLIENT_SIGNAL_CRIT}'
+          value: '-80'
+          description: Very weak signal threshold, dBm
+        - macro: '{$TRIGGER_CLIENT_SIGNAL_MIN}'
+          value: '-75'
+          description: Weak signal threshold, dBm
+        - macro: '{$TRIGGER_CLIENT_SIGNAL_TIME}'
+          value: 10m
+          description: Signal must stay below threshold this long
+        - macro: '{$TRIGGER_CLIENT_TXDROPPED_TIME}'
+          value: 30m
+          description: Dropped frames must stay above threshold this long
+        - macro: '{$TRIGGER_CLIENT_TXDROPPED}'
+          value: '5'
+          description: Dropped frames threshold, %
+        - macro: '{$TRIGGER_CLIENT_TXRETRIES_MIN_PPS}'
+          value: '5'
+          description: Tx Retries, Low CCQ and Dropped frames triggers fire only if the AP sends more than this many packets/s to the client
+        - macro: '{$TRIGGER_CLIENT_TXRETRIES_TIME}'
+          value: 30m
+          description: Tx Retries must stay above threshold this long
+        - macro: '{$TRIGGER_CLIENT_TXRETRIES}'
+          value: '30'
+          description: Tx Retries threshold, %
