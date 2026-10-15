@@ -14,7 +14,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/), versioning: [SemVer](ht
   - **UniFi Network API - Wi-Fi Client**: signal, noise, SNR, Tx/Rx rate, Tx retries, CCQ, MCS, dropped frames, Experience,
     band / channel / width / standard / MIMO, roaming history (30 days), traffic, ICMP ping, UniFi anomalies.
     Rate alerts off by default; ping alert can be switched off with `{$TRIGGER_CLIENT_PING}`.
-- Documentation of the add-on in English and Russian: `docs/WIFI_CLIENTS.md`, `docs/WIFI_CLIENTS.ru.md`.
+- Documentation of the add-on in English and Russian: `docs/WIFI_CLIENTS.md`, `docs/WIFI_CLIENTS.ru.md`;
+  README: add-on in Features and Installation; release notes `docs/RELEASE_NOTES_v1.1.0.md`; archive `dist/Zabbix_unifi_os_ap_api_7.0-v1.1.0.zip`.
 
 ## [1.0.0] - 2026-10-09
 
@@ -62,7 +63,8 @@ First release. Zabbix 7.0 port of
   - **UniFi Network API - Wi-Fi Client**: сигнал, шум, SNR, Tx/Rx Rate, Tx Retries, CCQ, MCS, потерянные кадры, Experience,
     диапазон / канал / ширина / стандарт / MIMO, журнал роуминга (30 дней), трафик, ICMP ping, аномалии UniFi.
     Тревоги по скорости по умолчанию выключены; тревогу ping можно выключить макросом `{$TRIGGER_CLIENT_PING}`.
-- Документация дополнения на английском и русском: `docs/WIFI_CLIENTS.md`, `docs/WIFI_CLIENTS.ru.md`.
+- Документация дополнения на английском и русском: `docs/WIFI_CLIENTS.md`, `docs/WIFI_CLIENTS.ru.md`;
+  README: дополнение в разделах «Возможности» и «Установка»; описание релиза `docs/RELEASE_NOTES_v1.1.0.md`; архив `dist/Zabbix_unifi_os_ap_api_7.0-v1.1.0.zip`.
 
 ## [1.0.0] - 2026-10-09
 

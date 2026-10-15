@@ -59,6 +59,7 @@ This is a fork of [MassimilianoPasquini97/zbx_unifi_network_api](https://github.
 - **Thresholds for industrial sites.** Separate thresholds for 2.4 and 5 GHz (context macros). Tx Retry alerts are suppressed when there is little traffic.
 - **Safe discovery.** If the API fails for any site, discovery skips the run. Access points of that site are not marked as lost and are not deleted.
 - **Secrets in Vault.** The API key is a Vault secret macro. Raw API responses are not stored, and device keys returned by the internal API are stripped in preprocessing.
+- **Add-on: Wi-Fi clients by filter.** An optional separate template creates a host for each client that matches your filter (SSID, name, MAC vendor, site). See [below](#add-on-wi-fi-clients-by-filter).
 
 ## How it works
 
@@ -134,6 +135,8 @@ Discovered hosts go to the groups `UniFi Network/Sites` and `UniFi Network/Acces
 ### 5. Import the template
 
 **Data collection → Templates → Import** → `template/zbx_unifi_network_api_7.0.yaml`.
+
+Optional: to monitor individual clients, also import `template/zbx_unifi_wifi_clients_7.0.yaml` and follow [docs/WIFI_CLIENTS.md](docs/WIFI_CLIENTS.md).
 
 ### 6. Create the main host
 
